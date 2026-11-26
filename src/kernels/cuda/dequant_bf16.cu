@@ -64,6 +64,16 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
             put(out, j, (float) (((b[6 + j] & 0x0F) | xh0) - 16) * d);
             put(out, j + 16, (float) (((b[6 + j] >> 4) | xh1) - 16) * d);
         }
+    } else if constexpr (TYPE == 7) {                              // Q5_1: d(2) m(2) qh(4) qs(16) = 24 B
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 24;
+        const float d = h2f(b), m = h2f(b + 2);
+        const uint32_t qh = (uint32_t) b[4] | ((uint32_t) b[5] << 8) | ((uint32_t) b[6] << 16) | ((uint32_t) b[7] << 24);
+        for (int j = 0; j < 16; ++j) {
+            const int xh0 = ((qh >> j) << 4) & 0x10;
+            const int xh1 = (qh >> (j + 12)) & 0x10;
+            put(out, j, (float) ((b[8 + j] & 0x0F) | xh0) * d + m);
+            put(out, j + 16, (float) ((b[8 + j] >> 4) | xh1) * d + m);
+        }
     } else if constexpr (TYPE == 8) {                              // Q8_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 34;
         const float d = h2f(b);
@@ -252,6 +262,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     switch (type) {
     case 2: block_elems = 32; block_bytes = 18; return true;
     case 6: block_elems = 32; block_bytes = 22; return true;
+    case 7: block_elems = 32; block_bytes = 24; return true;
     case 8: block_elems = 32; block_bytes = 34; return true;
     case 20: block_elems = 32; block_bytes = 18; return true;
     case 11: block_elems = 256; block_bytes = 110; return true;
@@ -280,6 +291,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     switch (type) {
     case 2: STRATA_DQ(2);
     case 6: STRATA_DQ(6);
+    case 7: STRATA_DQ(7);
     case 8: STRATA_DQ(8);
     case 11: STRATA_DQ(11);
     case 12: STRATA_DQ(12);
@@ -311,8 +323,146 @@ void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows,
     launch<uint16_t>(ggml_type, blocks, row0, rows, cols, out, stream);
 }
 
+// Coalesced K-Major SoA Q8_0 -> row-major FP16: 32 rows x 16 cols/block, 100% coalesced LDG.E.128 + HFMA2 + uint4 STG.E.128!
+__global__ void __launch_bounds__(32) dequant_q8_0_soa_km_f16_kernel(const uint8_t* __restrict__ blocks, int64_t total_N,
+                                                                     int64_t row0, int64_t rows, int64_t cols,
+                                                                     uint4* __restrict__ out4) {
+    const int64_t r = (int64_t) blockIdx.x * 32 + threadIdx.x;
+    const int64_t u = (int64_t) blockIdx.y;   // 0 .. cols/16 - 1
+    if (r >= rows) return;
+    const int64_t row = row0 + r;
+    const int64_t b = u >> 1;
+    const uint4* Wq = reinterpret_cast<const uint4*>(blocks);
+    const __half* Wd = reinterpret_cast<const __half*>(blocks + (size_t) total_N * (size_t) cols);
+    const uint4 qv = __ldg(Wq + (size_t) u * total_N + row);
+    const __half dh = __ldg(Wd + (size_t) b * total_N + row);
+    const __half2 dh2 = __halves2half2(dh, dh);
+    const __half2 c1152 = __floats2half2_rn(1152.0f, 1152.0f);
+    auto dec2 = [&](uint32_t w) -> uint2 {
+        const uint32_t lo = __byte_perm(w, 0x64006400u, 0x5150);
+        const uint32_t hi = __byte_perm(w, 0x64006400u, 0x7372);
+        const __half2 r0 = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&lo), c1152), dh2);
+        const __half2 r1 = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&hi), c1152), dh2);
+        return make_uint2(*reinterpret_cast<const uint32_t*>(&r0), *reinterpret_cast<const uint32_t*>(&r1));
+    };
+    const uint2 p0 = dec2(qv.x), p1 = dec2(qv.y), p2 = dec2(qv.z), p3 = dec2(qv.w);
+    const int64_t K_u4 = cols / 16;
+    uint4* dst = out4 + (size_t) r * (K_u4 * 2) + u * 2;
+    dst[0] = make_uint4(p0.x, p0.y, p1.x, p1.y);
+    dst[1] = make_uint4(p2.x, p2.y, p3.x, p3.y);
+}
+
+__global__ void dequant_q8_0_soa_f16_kernel(const uint8_t* __restrict__ blocks, int64_t total_N,
+                                            int64_t row0, int64_t rows, int64_t cols, bool row_major,
+                                            __half* __restrict__ out) {
+    const int64_t K_u4 = cols / 16;
+    const int64_t K_blk = cols / 32;
+    const int64_t idx = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * K_u4) return;
+    const int64_t r = idx / K_u4;
+    const int64_t u = idx - r * K_u4;
+    const int64_t row = row0 + r;
+    const int64_t b = u >> 1;
+    const uint4* Wq = reinterpret_cast<const uint4*>(blocks);
+    const __half* Wd = reinterpret_cast<const __half*>(blocks + (size_t) total_N * (size_t) cols);
+    const uint4 qv = row_major ? __ldg(Wq + (size_t) row * K_u4 + u)
+                               : __ldg(Wq + (size_t) u * total_N + row);
+    const __half dh = row_major ? __ldg(Wd + (size_t) row * K_blk + b)
+                                : __ldg(Wd + (size_t) b * total_N + row);
+    const __half2 dh2 = __halves2half2(dh, dh);
+    const __half2 c1152 = __floats2half2_rn(1152.0f, 1152.0f);
+    auto dec2 = [&](uint32_t w) -> uint2 {
+        const uint32_t lo = __byte_perm(w, 0x64006400u, 0x5150);
+        const uint32_t hi = __byte_perm(w, 0x64006400u, 0x7372);
+        const __half2 r0 = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&lo), c1152), dh2);
+        const __half2 r1 = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&hi), c1152), dh2);
+        return make_uint2(*reinterpret_cast<const uint32_t*>(&r0), *reinterpret_cast<const uint32_t*>(&r1));
+    };
+    const uint2 p0 = dec2(qv.x), p1 = dec2(qv.y), p2 = dec2(qv.z), p3 = dec2(qv.w);
+    uint4* dst = reinterpret_cast<uint4*>(out + (size_t) r * cols + u * 16);
+    dst[0] = make_uint4(p0.x, p0.y, p1.x, p1.y);
+    dst[1] = make_uint4(p2.x, p2.y, p3.x, p3.y);
+}
+
+// Coalesced K-Major SoA Q6_K -> row-major FP16: 32 rows/block (100% coalesced LDG.E.128) + uint4 STG.E.128!
+__global__ void __launch_bounds__(32) dequant_q6_k_soa_f16_kernel(const uint8_t* __restrict__ blocks, int64_t total_N,
+                                                                  int64_t row0, int64_t rows, int64_t cols,
+                                                                  __half* __restrict__ out) {
+    const int64_t K_blk = cols / 256;
+    const int64_t r = (int64_t) blockIdx.x * 32 + threadIdx.x;
+    if (r >= rows) return;
+    const int64_t bs = (int64_t) blockIdx.y;
+    const int64_t b = bs >> 2;
+    const int strip = (int) (bs & 3);
+    const int64_t row = row0 + r;
+    const int hf = strip >> 1;
+    const int s = strip & 1;
+    const uint4* Wql = reinterpret_cast<const uint4*>(blocks);
+    const uint4* Wqh = Wql + (size_t) K_blk * 8 * total_N;
+    const uint4* Wsc = Wqh + (size_t) K_blk * 4 * total_N;
+    const __half* Wd = reinterpret_cast<const __half*>(Wsc + (size_t) K_blk * total_N);
+    const uint4 ql_a = __ldg(Wql + (size_t) (b * 8 + hf * 4 + s) * total_N + row);
+    const uint4 ql_b = __ldg(Wql + (size_t) (b * 8 + hf * 4 + 2 + s) * total_N + row);
+    const uint4 qh_v = __ldg(Wqh + (size_t) (b * 4 + hf * 2 + s) * total_N + row);
+    const uint4 sc_v = __ldg(Wsc + (size_t) b * total_N + row);
+    const float d = __half2float(__ldg(Wd + (size_t) b * total_N + row));
+    const int8_t* sc = reinterpret_cast<const int8_t*>(&sc_v);
+    const __half2 s1 = __float2half2_rn(d * (float) sc[hf * 8 + s + 0]);
+    const __half2 s2 = __float2half2_rn(d * (float) sc[hf * 8 + s + 2]);
+    const __half2 s3 = __float2half2_rn(d * (float) sc[hf * 8 + s + 4]);
+    const __half2 s4 = __float2half2_rn(d * (float) sc[hf * 8 + s + 6]);
+    const __half2 c1056 = __floats2half2_rn(1056.0f, 1056.0f);
+    const uint32_t a4[4] = {ql_a.x, ql_a.y, ql_a.z, ql_a.w};
+    const uint32_t b4[4] = {ql_b.x, ql_b.y, ql_b.z, ql_b.w};
+    const uint32_t h4[4] = {qh_v.x, qh_v.y, qh_v.z, qh_v.w};
+    auto dec = [&](uint32_t q, __half2 scale) -> uint2 {
+        const uint32_t lo = __byte_perm(q, 0x64006400u, 0x5150);
+        const uint32_t hi = __byte_perm(q, 0x64006400u, 0x7372);
+        const __half2 r0 = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&lo), c1056), scale);
+        const __half2 r1 = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&hi), c1056), scale);
+        return make_uint2(*reinterpret_cast<const uint32_t*>(&r0), *reinterpret_cast<const uint32_t*>(&r1));
+    };
+    uint2* dst2 = reinterpret_cast<uint2*>(out + (size_t) r * cols + b * 256 + hf * 128 + s * 16);
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        const uint32_t la = a4[u], lb = b4[u], hv = h4[u];
+        const uint32_t q1 = (la & 0x0f0f0f0fu)        | ((hv & 0x03030303u) << 4);
+        const uint32_t q2 = (lb & 0x0f0f0f0fu)        | ((hv & 0x0c0c0c0cu) << 2);
+        const uint32_t q3 = ((la >> 4) & 0x0f0f0f0fu) | (hv & 0x30303030u);
+        const uint32_t q4 = ((lb >> 4) & 0x0f0f0f0fu) | ((hv >> 2) & 0x30303030u);
+        dst2[u +  0] = dec(q1, s1);
+        dst2[u +  8] = dec(q2, s2);
+        dst2[u + 16] = dec(q3, s3);
+        dst2[u + 24] = dec(q4, s4);
+    }
+}
+
 void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
-                 void* stream) {
+                 void* stream, int64_t total_rows) {
+    if (ggml_type == 108 || ggml_type == 109) {
+        const int64_t tN = total_rows > 0 ? total_rows : (row0 + rows);
+        if (ggml_type == 108) {
+            const dim3 grid((unsigned) ((rows + 31) / 32), (unsigned) (cols / 16));
+            dequant_q8_0_soa_km_f16_kernel<<<grid, 32, 0, (cudaStream_t) stream>>>(
+                (const uint8_t*) blocks, tN, row0, rows, cols, reinterpret_cast<uint4*>(out));
+        } else {
+            const int64_t total = rows * (cols / 16);
+            dequant_q8_0_soa_f16_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, (cudaStream_t) stream>>>(
+                (const uint8_t*) blocks, tN, row0, rows, cols, true, reinterpret_cast<__half*>(out));
+        }
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) { std::fprintf(stderr, "dequant soa q8 launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        return;
+    }
+    if (ggml_type == 114) {
+        const int64_t tN = total_rows > 0 ? total_rows : (row0 + rows);
+        const dim3 grid((unsigned) ((rows + 31) / 32), (unsigned) ((cols / 256) * 4));
+        dequant_q6_k_soa_f16_kernel<<<grid, 32, 0, (cudaStream_t) stream>>>(
+            (const uint8_t*) blocks, tN, row0, rows, cols, reinterpret_cast<__half*>(out));
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) { std::fprintf(stderr, "dequant soa q6k launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        return;
+    }
     if (iq_only(ggml_type)) {
         iq_dequant_f16(ggml_type, (const uint8_t*) blocks + (size_t) row0 * iq_row_bytes(ggml_type, cols), rows * cols,
                        out, stream);

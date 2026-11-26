@@ -255,9 +255,55 @@ TierState& tier_of(Glm5Model::FastState& F, const Glm5Geometry& g, int dev, cons
 // ---------------------------------------------------------------- NodeLane
 
 NodeLane::NodeLane(int node_, std::vector<int> cpus_, int threads) : node(node_), cpus(std::move(cpus_)) {
-    pool = std::make_shared<glmfast::Workers>(std::max(0, threads - 1), 20000, cpus);
+    // Pin each worker 1-to-1 onto distinct physical cores first (avoiding two workers landing on SMT siblings of the
+    // same Ivy Bridge core, which halved per-core L1d/AVX bandwidth). Leave the last physical core(s) free for the
+    // GPU service thread(s) on this socket. MAYA_GLM_NUMA_PIN_1TO1=0 restores the whole-node mask.
+    std::vector<int> ordered;
+#ifdef __linux__
+    std::vector<int> phys, smt;
+    std::vector<std::pair<int, int>> seen;
+    for (int c : cpus) {
+        int pkg = -1, core = -1;
+        const std::string t = "/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/";
+        std::ifstream(t + "physical_package_id") >> pkg;
+        std::ifstream(t + "core_id") >> core;
+        if (pkg >= 0 && core >= 0) {
+            const std::pair<int, int> key{pkg, core};
+            if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+                seen.push_back(key);
+                phys.push_back(c);
+            } else {
+                smt.push_back(c);
+            }
+        } else {
+            phys.push_back(c);
+        }
+    }
+    // Keep CPU 0 (boot/IRQ/main-thread core on Node 0) at the end of physical cores so 1-to-1 workers don't contend with it.
+    if (auto it = std::find(phys.begin(), phys.end(), 0); it != phys.end() && phys.size() > 1) {
+        phys.erase(it);
+        phys.push_back(0);
+    }
+    ordered.reserve(cpus.size());
+    ordered.insert(ordered.end(), phys.begin(), phys.end());
+    ordered.insert(ordered.end(), smt.begin(), smt.end());
+#else
+    ordered = cpus;
+#endif
+    const int n_work = std::max(0, threads - 1);
+    const bool one_to_one = env_int("MAYA_GLM_NUMA_PIN_1TO1", 1) != 0 && !ordered.empty();
+    if (one_to_one && (int) ordered.size() > n_work) {
+        // Reserve all remaining CPUs on this node strictly disjoint from workers [0..n_work-1] for the GPU service
+        // thread(s) (which act as the pool's last worker), giving 2+ GPUs on the same socket separate CPUs while
+        // never colliding with any spinning worker core.
+        for (size_t i = (size_t) n_work; i < ordered.size(); ++i) {
+            if (ordered[i] != 0) svc_cpus.push_back(ordered[i]);
+            if (svc_cpus.size() >= 4) break;
+        }
+    }
+    pool = std::make_shared<glmfast::Workers>(n_work, 20000, one_to_one ? ordered : cpus, false, one_to_one);
     th_ = std::thread([this] { loop(); });
-    glmfast::pin_thread(th_.native_handle(), cpus);
+    glmfast::pin_thread(th_.native_handle(), svc_cpus.empty() ? cpus : svc_cpus);
 }
 
 NodeLane::~NodeLane() {
@@ -720,9 +766,9 @@ bool lane_pools(Glm5Model::FastState& F, const Glm5Geometry& g, int n_parts, int
         auto ln = socket_lane(F, g, node, per_node(node), dev);   // W6 runtime fix: held for the load (shared)
         F.cpu_pool = ln->pool;
         F.cpu_node = node;
-        F.cpu_pin = ln->cpus;
-        std::fprintf(stderr, "glm tier: CUDA%d CPU lane: the pool of NUMA node %d (%d threads on its %zu CPUs)\n", dev,
-                     node, ln->pool->size(), ln->cpus.size());
+        F.cpu_pin = ln->svc_cpus.empty() ? ln->cpus : ln->svc_cpus;
+        std::fprintf(stderr, "glm tier: CUDA%d CPU lane: the pool of NUMA node %d (%d threads on its %zu CPUs, svc core %d)\n",
+                     dev, node, ln->pool->size(), ln->cpus.size(), F.cpu_pin.empty() ? -1 : F.cpu_pin[0]);
         return true;
     }
     // node-split: both sockets' pools; the service thread sits on node 0 with its pool

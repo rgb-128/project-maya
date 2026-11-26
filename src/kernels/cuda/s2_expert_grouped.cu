@@ -417,7 +417,9 @@ __global__ void hit_select_multi_kernel(const int32_t* __restrict__ ids, const i
 }
 
 __global__ void add_hits_kernel(float* __restrict__ parts, const float* __restrict__ hit_out,
-                                const int32_t* __restrict__ dst, const int32_t* __restrict__ count, int n_embd) {
+                                const int32_t* __restrict__ dst, const int32_t* __restrict__ count, int n_embd,
+                                const uint32_t* __restrict__ skip, uint32_t ring) {
+    if (skip != nullptr && *skip == ring) return;
     const int h = blockIdx.y;
     if (h >= *count) return;
     const size_t row = (size_t) dst[h] * (size_t) n_embd;
@@ -691,7 +693,371 @@ __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, in
         ent_tok[at] = i / k_per_tok;
     }
 }
+// =================================================================================================
+// GP100 K-Major SoA HFMA2 S2 Grouped Experts (for MTP 512 S2 experts):
+// Replaces emulated __dp4a (4x VMAD) + uncoalesced row-major loads with coalesced LDG.E.128 + HFMA2!
+// Exact same byte size (O_GU_CODES=819200 | O_D_CODES=409600 | O_GU_SCALES=102400 | O_D_SCALES=51200).
+// Gate/Up rows are de-interleaved on repack: r in [0..639] = gate, r in [640..1279] = up.
+// =================================================================================================
+__global__ void s2_repack_blob_soa_kernel(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst) {
+    const int idx = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    // Gate/Up: 2*FF * SC_GU = 1280 * 40 = 51200 blocks (each 16B codes + 2B scale)
+    constexpr int N_GU = 2 * FF;
+    constexpr int TOT_GU = N_GU * SC_GU;
+    constexpr int TOT_DN = H * SC_D;
+    if (idx < TOT_GU) {
+        const int r_orig = idx / SC_GU;   // interleaved: 2*g or 2*u+1
+        const int b = idx % SC_GU;
+        const int r_dst = (r_orig & 1) ? (FF + (r_orig >> 1)) : (r_orig >> 1);
+        uint4 v;
+        memcpy(&v, src + (size_t) r_orig * ROW_GU + (size_t) b * 16, 16);
+        reinterpret_cast<uint4*>(dst)[(size_t) b * N_GU + r_dst] = v;
+        uint16_t sc;
+        memcpy(&sc, src + O_GU_SCALES + (size_t) (r_orig * SC_GU + b) * 2, 2);
+        reinterpret_cast<uint16_t*>(dst + O_GU_SCALES)[(size_t) b * N_GU + r_dst] = sc;
+    } else if (idx < TOT_GU + TOT_DN) {
+        const int d = idx - TOT_GU;
+        const int r = d / SC_D;
+        const int b = d % SC_D;
+        uint4 v;
+        memcpy(&v, src + O_D_CODES + (size_t) r * ROW_D + (size_t) b * 16, 16);
+        reinterpret_cast<uint4*>(dst + O_D_CODES)[(size_t) b * H + r] = v;
+        uint16_t sc;
+        memcpy(&sc, src + O_D_SCALES + (size_t) (r * SC_D + b) * 2, 2);
+        reinterpret_cast<uint16_t*>(dst + O_D_SCALES)[(size_t) b * H + r] = sc;
+    }
+}
+
+__device__ __forceinline__ __half2 s2_q80_pair_h2(const int8_t* qs2, __half2 c1152, __half2 inv128) {
+    const uint32_t b0 = (uint8_t) qs2[0];
+    const uint32_t b1 = (uint8_t) qs2[1];
+    const uint32_t vx = (b0 | (b1 << 8)) ^ 0x8080u;
+    const uint32_t h = __byte_perm(vx, 0x64006400u, 0x5150);
+    return __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&h), c1152), inv128);
+}
+
+// Gate/Up K-Major SoA S2: 32 rows/block, NW=5 warps split SC_GU=40 blocks (8 blocks/warp),
+// 100% coalesced LDG.E.128, native HFMA2 + __byte_perm Q2_0 decode!
+__global__ void __launch_bounds__(160, 4) p100_s2_gu_soa_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
+    const uint8_t* __restrict__ x_q8_0, const float* __restrict__ x_scales,
+    float* __restrict__ gate_up, int cap_entries) {
+    const int g = (int) blockIdx.y;
+    if (g >= *n_groups) return;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    if (e0 >= e1) return;
+
+    constexpr int NW = 5;
+    constexpr int N_GU = 2 * FF;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int r = (int) blockIdx.x * 32 + lane;
+    const bool valid = r < N_GU;
+
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint4* Wq = reinterpret_cast<const uint4*>(blob);
+    const __half* Wd = reinterpret_cast<const __half*>(blob + O_GU_SCALES);
+
+    __shared__ __half2 sxh[2][H / 2];    // 10240 B
+    __shared__ float sxd[2][H / 32];     //   640 B
+    __shared__ float spart[2][NW][32];   //  1280 B -> total 12,160 B -> 4 blocks/SM!
+    const __half2 c1152 = __floats2half2_rn(1152.0f, 1152.0f);
+    const __half2 inv128 = __floats2half2_rn(1.0f / 128.0f, 1.0f / 128.0f);
+    constexpr uint32_t tbl01 = 0x0000BC00u;  // {-1.0h, 0.0h}
+    constexpr uint32_t tbl23 = 0x40003C00u;  // {+1.0h, +2.0h}
+
+    auto stage_tok = [&](int slot, int tok) {
+        const uint8_t* xt = x_q8_0 + (size_t) tok * (size_t) (H / 32) * 34;
+        const float* xs = x_scales ? x_scales + (size_t) tok * (H / 32) : nullptr;
+        for (int i = tid; i < H / 2; i += 160) {
+            const int blk = i >> 4, sub = (i & 15) << 1;
+            const uint8_t* xb = xt + (size_t) blk * 34;
+            sxh[slot][i] = s2_q80_pair_h2(reinterpret_cast<const int8_t*>(xb + 2) + sub, c1152, inv128);
+        }
+        if (tid < H / 32) {
+            const uint8_t* xb = xt + (size_t) tid * 34;
+            sxd[slot][tid] = (xs ? xs[tid] : f16_at(xb)) * 128.0f;
+        }
+    };
+
+    for (int eb = e0; eb < e1; eb += 2) {
+        const int ne = (eb + 1 < e1) ? 2 : 1;
+        stage_tok(0, ent_tok[eb]);
+        if (ne == 2) stage_tok(1, ent_tok[eb + 1]);
+        __syncthreads();
+
+        float acc0 = 0.0f, acc1 = 0.0f;
+        if (valid) {
+            for (int b = warp; b < SC_GU; b += NW) {
+                const uint4 q4 = __ldg(Wq + (size_t) b * N_GU + r);
+                const float db = __half2float(__ldg(Wd + (size_t) b * N_GU + r));
+                const uint32_t wv[4] = {q4.x, q4.y, q4.z, q4.w};
+                __half2 s0_lo = __floats2half2_rn(0.0f, 0.0f), s0_hi = __floats2half2_rn(0.0f, 0.0f);
+                __half2 s1_lo = __floats2half2_rn(0.0f, 0.0f), s1_hi = __floats2half2_rn(0.0f, 0.0f);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const uint32_t w = wv[u];
+                    __half2& d0 = (u < 2) ? s0_lo : s0_hi;
+                    __half2& d1 = (u < 2) ? s1_lo : s1_hi;
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        const uint32_t qb = (w >> (c * 8)) & 0xffu;
+                        const unsigned a0 = (qb & 3u) << 1, b0 = ((qb >> 2) & 3u) << 1;
+                        const unsigned a1 = ((qb >> 4) & 3u) << 1, b1 = ((qb >> 6) & 3u) << 1;
+                        const uint32_t p0 = __byte_perm(tbl01, tbl23, 0x1010u | a0 | (a0 << 4) | (b0 << 8) | (b0 << 12));
+                        const uint32_t p1 = __byte_perm(tbl01, tbl23, 0x1010u | a1 | (a1 << 4) | (b1 << 8) | (b1 << 12));
+                        const __half2 h0 = *reinterpret_cast<const __half2*>(&p0);
+                        const __half2 h1 = *reinterpret_cast<const __half2*>(&p1);
+                        const int xoff = b * 32 + u * 8 + c * 2;
+                        d0 = __hfma2(h0, sxh[0][xoff + 0], d0);
+                        d0 = __hfma2(h1, sxh[0][xoff + 1], d0);
+                        if (ne == 2) {
+                            d1 = __hfma2(h0, sxh[1][xoff + 0], d1);
+                            d1 = __hfma2(h1, sxh[1][xoff + 1], d1);
+                        }
+                    }
+                }
+                acc0 += db * ((__low2float(s0_lo) + __high2float(s0_lo)) * sxd[0][b * 2] +
+                              (__low2float(s0_hi) + __high2float(s0_hi)) * sxd[0][b * 2 + 1]);
+                if (ne == 2) {
+                    acc1 += db * ((__low2float(s1_lo) + __high2float(s1_lo)) * sxd[1][b * 2] +
+                                  (__low2float(s1_hi) + __high2float(s1_hi)) * sxd[1][b * 2 + 1]);
+                }
+            }
+        }
+        spart[0][warp][lane] = acc0;
+        if (ne == 2) spart[1][warp][lane] = acc1;
+        __syncthreads();
+        if (warp == 0 && valid) {
+            const bool is_up = r >= FF;
+            const int ro = is_up ? r - FF : r;
+            const size_t base0 = is_up ? ((size_t) cap_entries * FF + (size_t) eb * FF) : ((size_t) eb * FF);
+            gate_up[base0 + ro] = spart[0][0][lane] + spart[0][1][lane] + spart[0][2][lane] + spart[0][3][lane] + spart[0][4][lane];
+            if (ne == 2) {
+                const size_t base1 = is_up ? ((size_t) cap_entries * FF + (size_t) (eb + 1) * FF) : ((size_t) (eb + 1) * FF);
+                gate_up[base1 + ro] = spart[1][0][lane] + spart[1][1][lane] + spart[1][2][lane] + spart[1][3][lane] + spart[1][4][lane];
+            }
+        }
+        if (eb + 2 < e1) __syncthreads();
+    }
+}
+
+// Down K-Major SoA S2: 64 rows/block (1 thread = 1 row), 100% coalesced LDG.E.128 + HFMA2!
+__global__ void __launch_bounds__(64, 16) p100_s2_dn_soa_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
+    const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales, float* __restrict__ out) {
+    const int g = (int) blockIdx.y;
+    if (g >= *n_groups) return;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    if (e0 >= e1) return;
+
+    const int tid = threadIdx.x;
+    const int r = (int) blockIdx.x * 64 + tid;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint4* Wq = reinterpret_cast<const uint4*>(blob + O_D_CODES);
+    const __half* Wd = reinterpret_cast<const __half*>(blob + O_D_SCALES);
+
+    __shared__ __half2 sxh[2][FF / 2];  // 2560 B
+    __shared__ float sxd[2][FF / 32];   //  160 B -> total 2,720 B (16 blocks/SM!)
+    const __half2 c1152 = __floats2half2_rn(1152.0f, 1152.0f);
+    const __half2 inv128 = __floats2half2_rn(1.0f / 128.0f, 1.0f / 128.0f);
+    constexpr uint32_t tbl01 = 0x0000BC00u;
+    constexpr uint32_t tbl23 = 0x40003C00u;
+
+    auto stage_ent = [&](int slot, int ent_id) {
+        const uint8_t* xt = h_q8_0 + (size_t) ent_id * (size_t) (FF / 32) * 34;
+        const float* xs = h_scales ? h_scales + (size_t) ent_id * (FF / 32) : nullptr;
+        for (int i = tid; i < FF / 2; i += 64) {
+            const int blk = i >> 4, sub = (i & 15) << 1;
+            const uint8_t* xb = xt + (size_t) blk * 34;
+            sxh[slot][i] = s2_q80_pair_h2(reinterpret_cast<const int8_t*>(xb + 2) + sub, c1152, inv128);
+        }
+        if (tid < FF / 32) {
+            const uint8_t* xb = xt + (size_t) tid * 34;
+            sxd[slot][tid] = (xs ? xs[tid] : f16_at(xb)) * 128.0f;
+        }
+    };
+
+    for (int eb = e0; eb < e1; eb += 2) {
+        const int ne = (eb + 1 < e1) ? 2 : 1;
+        stage_ent(0, eb);
+        if (ne == 2) stage_ent(1, eb + 1);
+        __syncthreads();
+
+        if (r < H) {
+            float acc0 = 0.0f, acc1 = 0.0f;
+            for (int b = 0; b < SC_D; ++b) {
+                const uint4 q4 = __ldg(Wq + (size_t) b * H + r);
+                const float db = __half2float(__ldg(Wd + (size_t) b * H + r));
+                const uint32_t wv[4] = {q4.x, q4.y, q4.z, q4.w};
+                __half2 s0_lo = __floats2half2_rn(0.0f, 0.0f), s0_hi = __floats2half2_rn(0.0f, 0.0f);
+                __half2 s1_lo = __floats2half2_rn(0.0f, 0.0f), s1_hi = __floats2half2_rn(0.0f, 0.0f);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const uint32_t w = wv[u];
+                    __half2& d0 = (u < 2) ? s0_lo : s0_hi;
+                    __half2& d1 = (u < 2) ? s1_lo : s1_hi;
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        const uint32_t qb = (w >> (c * 8)) & 0xffu;
+                        const unsigned a0 = (qb & 3u) << 1, b0 = ((qb >> 2) & 3u) << 1;
+                        const unsigned a1 = ((qb >> 4) & 3u) << 1, b1 = ((qb >> 6) & 3u) << 1;
+                        const uint32_t p0 = __byte_perm(tbl01, tbl23, 0x1010u | a0 | (a0 << 4) | (b0 << 8) | (b0 << 12));
+                        const uint32_t p1 = __byte_perm(tbl01, tbl23, 0x1010u | a1 | (a1 << 4) | (b1 << 8) | (b1 << 12));
+                        const __half2 h0 = *reinterpret_cast<const __half2*>(&p0);
+                        const __half2 h1 = *reinterpret_cast<const __half2*>(&p1);
+                        const int xoff = b * 32 + u * 8 + c * 2;
+                        d0 = __hfma2(h0, sxh[0][xoff + 0], d0);
+                        d0 = __hfma2(h1, sxh[0][xoff + 1], d0);
+                        if (ne == 2) {
+                            d1 = __hfma2(h0, sxh[1][xoff + 0], d1);
+                            d1 = __hfma2(h1, sxh[1][xoff + 1], d1);
+                        }
+                    }
+                }
+                acc0 += db * ((__low2float(s0_lo) + __high2float(s0_lo)) * sxd[0][b * 2] +
+                              (__low2float(s0_hi) + __high2float(s0_hi)) * sxd[0][b * 2 + 1]);
+                if (ne == 2) {
+                    acc1 += db * ((__low2float(s1_lo) + __high2float(s1_lo)) * sxd[1][b * 2] +
+                                  (__low2float(s1_hi) + __high2float(s1_hi)) * sxd[1][b * 2 + 1]);
+                }
+            }
+            out[(size_t) ent_dst[eb] * H + r] = acc0;
+            if (ne == 2) out[(size_t) ent_dst[eb + 1] * H + r] = acc1;
+        }
+        if (eb + 2 < e1) __syncthreads();
+    }
+}
+
+// Down K-Major SoA S2 Split-K5: 64 rows/block x 5 K-parts = 320 threads (each K-part computes 2 of SC_D=10 blocks),
+// 5x faster activation staging + 5x higher K-parallelism for MTP draft single-token MoE, STACK:0!
+__global__ void __launch_bounds__(320, 4) p100_s2_dn_soa_sk5_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
+    const uint8_t* __restrict__ h_q8_0, const float* __restrict__ h_scales, float* __restrict__ out) {
+    const int g = (int) blockIdx.y;
+    if (g >= *n_groups) return;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    if (e0 >= e1) return;
+
+    const int tid = threadIdx.x;
+    const int r_loc = tid & 63;
+    const int kb = tid >> 6;          // 0..4 (5 K-partitions of SC_D = 10 -> 2 blocks each!)
+    const int r = (int) blockIdx.x * 64 + r_loc;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint4* Wq = reinterpret_cast<const uint4*>(blob + O_D_CODES);
+    const __half* Wd = reinterpret_cast<const __half*>(blob + O_D_SCALES);
+
+    union S2DnSmem {
+        struct {
+            __align__(16) __half2 sxh[2][FF / 2];  // 2560 B
+            float sxd[2][FF / 32];                 //  160 B -> 2720 B
+        } x;
+        float part[2][5][64];                      // 2560 B -> 4 blocks/SM!
+    };
+    __shared__ S2DnSmem smem;
+    const __half2 c1152 = __floats2half2_rn(1152.0f, 1152.0f);
+    const __half2 inv128 = __floats2half2_rn(1.0f / 128.0f, 1.0f / 128.0f);
+    constexpr uint32_t tbl01 = 0x0000BC00u;
+    constexpr uint32_t tbl23 = 0x40003C00u;
+
+    auto stage_ent = [&](int slot, int ent_id) {
+        const uint8_t* xt = h_q8_0 + (size_t) ent_id * (size_t) (FF / 32) * 34;
+        const float* xs = h_scales ? h_scales + (size_t) ent_id * (FF / 32) : nullptr;
+        for (int i = tid; i < FF / 2; i += 320) {
+            const int blk = i >> 4, sub = (i & 15) << 1;
+            const uint8_t* xb = xt + (size_t) blk * 34;
+            smem.x.sxh[slot][i] = s2_q80_pair_h2(reinterpret_cast<const int8_t*>(xb + 2) + sub, c1152, inv128);
+        }
+        if (tid < FF / 32) {
+            const uint8_t* xb = xt + (size_t) tid * 34;
+            smem.x.sxd[slot][tid] = (xs ? xs[tid] : f16_at(xb)) * 128.0f;
+        }
+    };
+
+    for (int eb = e0; eb < e1; eb += 2) {
+        const int ne = (eb + 1 < e1) ? 2 : 1;
+        stage_ent(0, eb);
+        if (ne == 2) stage_ent(1, eb + 1);
+        __syncthreads();
+
+        float acc0 = 0.0f, acc1 = 0.0f;
+        if (r < H) {
+#pragma unroll
+            for (int it = 0; it < 2; ++it) {
+                const int b = kb + it * 5;
+                const uint4 q4 = __ldg(Wq + (size_t) b * H + r);
+                const float db = __half2float(__ldg(Wd + (size_t) b * H + r));
+                const uint32_t wv[4] = {q4.x, q4.y, q4.z, q4.w};
+                __half2 s0_lo = __floats2half2_rn(0.0f, 0.0f), s0_hi = __floats2half2_rn(0.0f, 0.0f);
+                __half2 s1_lo = __floats2half2_rn(0.0f, 0.0f), s1_hi = __floats2half2_rn(0.0f, 0.0f);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const uint32_t w = wv[u];
+                    __half2& d0 = (u < 2) ? s0_lo : s0_hi;
+                    __half2& d1 = (u < 2) ? s1_lo : s1_hi;
+#pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        const uint32_t qb = (w >> (c * 8)) & 0xffu;
+                        const unsigned a0 = (qb & 3u) << 1, b0 = ((qb >> 2) & 3u) << 1;
+                        const unsigned a1 = ((qb >> 4) & 3u) << 1, b1 = ((qb >> 6) & 3u) << 1;
+                        const uint32_t p0 = __byte_perm(tbl01, tbl23, 0x1010u | a0 | (a0 << 4) | (b0 << 8) | (b0 << 12));
+                        const uint32_t p1 = __byte_perm(tbl01, tbl23, 0x1010u | a1 | (a1 << 4) | (b1 << 8) | (b1 << 12));
+                        const __half2 h0 = *reinterpret_cast<const __half2*>(&p0);
+                        const __half2 h1 = *reinterpret_cast<const __half2*>(&p1);
+                        const int xoff = b * 32 + u * 8 + c * 2;
+                        d0 = __hfma2(h0, smem.x.sxh[0][xoff + 0], d0);
+                        d0 = __hfma2(h1, smem.x.sxh[0][xoff + 1], d0);
+                        if (ne == 2) {
+                            d1 = __hfma2(h0, smem.x.sxh[1][xoff + 0], d1);
+                            d1 = __hfma2(h1, smem.x.sxh[1][xoff + 1], d1);
+                        }
+                    }
+                }
+                acc0 += db * ((__low2float(s0_lo) + __high2float(s0_lo)) * smem.x.sxd[0][b * 2] +
+                              (__low2float(s0_hi) + __high2float(s0_hi)) * smem.x.sxd[0][b * 2 + 1]);
+                if (ne == 2) {
+                    acc1 += db * ((__low2float(s1_lo) + __high2float(s1_lo)) * smem.x.sxd[1][b * 2] +
+                                  (__low2float(s1_hi) + __high2float(s1_hi)) * smem.x.sxd[1][b * 2 + 1]);
+                }
+            }
+        }
+        __syncthreads();
+        smem.part[0][kb][r_loc] = acc0;
+        if (ne == 2) smem.part[1][kb][r_loc] = acc1;
+        __syncthreads();
+        if (kb == 0 && r < H) {
+            out[(size_t) ent_dst[eb] * H + r] =
+                smem.part[0][0][r_loc] + smem.part[0][1][r_loc] + smem.part[0][2][r_loc] + smem.part[0][3][r_loc] + smem.part[0][4][r_loc];
+            if (ne == 2) {
+                out[(size_t) ent_dst[eb + 1] * H + r] =
+                    smem.part[1][0][r_loc] + smem.part[1][1][r_loc] + smem.part[1][2][r_loc] + smem.part[1][3][r_loc] + smem.part[1][4][r_loc];
+            }
+        }
+        if (eb + 2 < e1) __syncthreads();
+    }
+}
 }  // namespace
+
+void s2_repack_experts_soa(uint8_t* experts_dev, int64_t n_experts, int64_t blob_bytes, void* stream) {
+    if (n_experts <= 0 || experts_dev == nullptr) return;
+    cudaStream_t cs = (cudaStream_t) stream;
+    uint8_t* scratch = nullptr;
+    if (cudaMalloc(&scratch, (size_t) blob_bytes) != cudaSuccess) {
+        std::fprintf(stderr, "s2_repack_experts_soa: scratch alloc failed\n");
+        std::exit(1);
+    }
+    constexpr int TOT = 2 * FF * SC_GU + H * SC_D;
+    const unsigned grid = (unsigned) ((TOT + 255) / 256);
+    for (int64_t e = 0; e < n_experts; ++e) {
+        uint8_t* bp = experts_dev + (size_t) e * (size_t) blob_bytes;
+        s2_repack_blob_soa_kernel<<<grid, 256, 0, cs>>>(bp, scratch);
+        cudaMemcpyAsync(bp, scratch, (size_t) blob_bytes, cudaMemcpyDeviceToDevice, cs);
+    }
+    cudaStreamSynchronize(cs);
+    cudaFree(scratch);
+}
 
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
@@ -704,7 +1070,8 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
 
 void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                     const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
-                    const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream) {
+                    const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream,
+                    bool soa) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     cudaStream_t cs = (cudaStream_t) stream;
     const uint64_t gu_bytes = ((uint64_t) cap_entries * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
@@ -712,7 +1079,11 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     float* gate_up = (float*) scratch;
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
     float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
-    {
+    if (soa) {
+        p100_s2_gu_soa_kernel<<<dim3((unsigned) (2 * FF / 32), (unsigned) cap_groups), 160, 0, cs>>>(
+            grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up, (int) cap_entries);
+        check("moe_grouped_s2/gu_soa", stream);
+    } else {
         gu_grouped_kernel<<<dim3((unsigned) (2 * FF / GU_ROWS), (unsigned) cap_groups), 256, 0, cs>>>(
             grp_ptr, grp_start, n_groups, ent_tok, x_q8_0, x_scales, gate_up, (int) cap_entries);
         check("moe_grouped_s2/gu", stream);
@@ -724,7 +1095,11 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     }
     if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap_entries * (int64_t) FF, stream);
     else quantize_q8_0(gate_up, h_q8_0, cap_entries * (int64_t) FF, stream);
-    {
+    if (soa) {
+        p100_s2_dn_soa_sk5_kernel<<<dim3((unsigned) (H / 64), (unsigned) cap_groups), 320, 0, cs>>>(
+            grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, x_scales != nullptr ? h_scales : nullptr, out);
+        check("moe_grouped_s2/down_soa", stream);
+    } else {
         down_grouped_kernel<<<dim3((unsigned) (H / D_ROWS), (unsigned) cap_groups), 256, 0, cs>>>(
             grp_ptr, grp_start, n_groups, ent_dst, h_q8_0, x_scales != nullptr ? h_scales : nullptr, out);
         check("moe_grouped_s2/down", stream);
@@ -732,10 +1107,10 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
 }
 
 void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const int32_t* count, int64_t cap,
-                 int64_t n_embd, void* stream) {
+                 int64_t n_embd, void* stream, const uint32_t* skip, uint32_t ring) {
     if (cap <= 0) return;
     const dim3 grid((unsigned) ((n_embd + 255) / 256 < 8 ? (n_embd + 255) / 256 : 8), (unsigned) cap);
-    add_hits_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(parts, hit_out, dst, count, (int) n_embd);
+    add_hits_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(parts, hit_out, dst, count, (int) n_embd, skip, ring);
     check("moe_hit_add", stream);
 }
 

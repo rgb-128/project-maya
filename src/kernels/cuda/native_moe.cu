@@ -38,6 +38,26 @@ __global__ void combine(const float* __restrict__ parts, const float* __restrict
     const int64_t tk = blockIdx.y;
     parts += tk * k * n_embd; weights += tk * k; if (shared) shared += tk * n_embd; output += tk * n_embd;
     const int64_t col = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if ((n_embd & 3) == 0) {
+        const int64_t n4 = n_embd >> 2;
+        if (col >= n4) return;
+        const float4* p4 = reinterpret_cast<const float4*>(parts);
+        const float w0 = weights[0];
+        const float4 a0 = p4[col];
+        float4 sum = make_float4(a0.x * w0, a0.y * w0, a0.z * w0, a0.w * w0);
+        for (int expert = 1; expert < k; ++expert) {
+            const float we = weights[expert];
+            const float4 ae = p4[int64_t(expert) * n4 + col];
+            sum.x = fmaf(ae.x, we, sum.x); sum.y = fmaf(ae.y, we, sum.y);
+            sum.z = fmaf(ae.z, we, sum.z); sum.w = fmaf(ae.w, we, sum.w);
+        }
+        if (shared) {
+            const float4 sh = reinterpret_cast<const float4*>(shared)[col];
+            sum.x += sh.x; sum.y += sh.y; sum.z += sh.z; sum.w += sh.w;
+        }
+        reinterpret_cast<float4*>(output)[col] = sum;
+        return;
+    }
     if (col >= n_embd) return;
     float sum = parts[col] * weights[0];
     for (int expert = 1; expert < k; ++expert) {
@@ -54,6 +74,52 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
     const auto ap = reinterpret_cast<uintptr_t>(a), bp = reinterpret_cast<uintptr_t>(b);
     return ap < bp + bn && bp < ap + an;
 }
+__global__ void combine_or_hit(const float* __restrict__ hit_out, const float* __restrict__ parts,
+                               const float* __restrict__ weights, const float* __restrict__ shared,
+                               float* __restrict__ output, const uint32_t* __restrict__ skip, uint32_t ring,
+                               int64_t n_embd, int k) {
+    const int64_t tk = blockIdx.y;
+    const bool use_hit = (*skip == ring);
+    const float* src = (use_hit ? hit_out : parts) + tk * k * n_embd;
+    weights += tk * k;
+    if (shared) shared += tk * n_embd;
+    output += tk * n_embd;
+    const int64_t col = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if ((n_embd & 3) == 0) {
+        const int64_t n4 = n_embd >> 2;
+        if (col >= n4) return;
+        const float4* s4 = reinterpret_cast<const float4*>(src);
+        const float w0 = weights[0];
+        float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (w0 != 0.0f) {
+            const float4 a0 = s4[col];
+            sum = make_float4(a0.x * w0, a0.y * w0, a0.z * w0, a0.w * w0);
+        }
+        for (int expert = 1; expert < k; ++expert) {
+            const float we = weights[expert];
+            if (we != 0.0f) {
+                const float4 ae = s4[int64_t(expert) * n4 + col];
+                sum.x = fmaf(ae.x, we, sum.x); sum.y = fmaf(ae.y, we, sum.y);
+                sum.z = fmaf(ae.z, we, sum.z); sum.w = fmaf(ae.w, we, sum.w);
+            }
+        }
+        if (shared) {
+            const float4 sh = reinterpret_cast<const float4*>(shared)[col];
+            sum.x += sh.x; sum.y += sh.y; sum.z += sh.z; sum.w += sh.w;
+        }
+        reinterpret_cast<float4*>(output)[col] = sum;
+        return;
+    }
+    if (col >= n_embd) return;
+    const float w0 = weights[0];
+    float sum = (w0 != 0.0f) ? (src[col] * w0) : 0.0f;
+    for (int expert = 1; expert < k; ++expert) {
+        const float we = weights[expert];
+        if (we != 0.0f) sum += src[int64_t(expert) * n_embd + col] * we;
+    }
+    if (shared) sum += shared[col];
+    output[col] = sum;
+}
 }
 void native_moe_combine_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_moe_combine_enabled() { return enabled.load(std::memory_order_relaxed); }
@@ -69,7 +135,9 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
             || overlap(output, row_bytes, weights, weight_bytes)
             || (shared && overlap(output, row_bytes, shared, row_bytes)))
         throw std::invalid_argument("native MoE combine requires aligned spans and disjoint output");
-    combine<<<unsigned((n_embd + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    const unsigned gx = (n_embd & 3) == 0 ? unsigned(((n_embd >> 2) + 63) / 64) : unsigned((n_embd + 255) / 256);
+    const unsigned bx = (n_embd & 3) == 0 ? 64u : 256u;
+    combine<<<gx, bx, 0, static_cast<cudaStream_t>(stream)>>>(
         parts, weights, shared, output, n_embd, int(k));
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
@@ -78,8 +146,22 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
                               int64_t n_embd, int64_t k, int n_tok, void* stream) {
     if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
         throw std::invalid_argument("native MoE combine (multi) requires a stream, width, 1..15 experts, tokens");
-    combine<<<dim3(unsigned((n_embd + 255) / 256), (unsigned) n_tok), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+    const unsigned gx = (n_embd & 3) == 0 ? unsigned(((n_embd >> 2) + 63) / 64) : unsigned((n_embd + 255) / 256);
+    const unsigned bx = (n_embd & 3) == 0 ? 64u : 256u;
+    combine<<<dim3(gx, (unsigned) n_tok), bx, 0, static_cast<cudaStream_t>(stream)>>>(
         parts, weights, shared, output, n_embd, int(k));
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_moe_combine_multi_or_hit(const float* hit_out, const float* parts, const float* weights,
+                                     const float* shared, float* output, const uint32_t* skip, uint32_t ring,
+                                     int64_t n_embd, int64_t k, int n_tok, void* stream) {
+    if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1)
+        throw std::invalid_argument("native MoE combine (or_hit) requires a stream, width, 1..15 experts, tokens");
+    const unsigned gx = (n_embd & 3) == 0 ? unsigned(((n_embd >> 2) + 63) / 64) : unsigned((n_embd + 255) / 256);
+    const unsigned bx = (n_embd & 3) == 0 ? 64u : 256u;
+    combine_or_hit<<<dim3(gx, (unsigned) n_tok), bx, 0, static_cast<cudaStream_t>(stream)>>>(
+        hit_out, parts, weights, shared, output, skip, ring, n_embd, int(k));
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

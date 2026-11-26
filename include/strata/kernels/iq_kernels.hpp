@@ -12,8 +12,10 @@
 
 namespace strata::kernels {
 
-/// ggml type ids handled here.
+/// ggml type ids handled here (IQ + Q2_0/Q3_K).
 bool iq_supported(int ggml_type) noexcept;
+/// ggml type ids with GPU dequantizer support (iq_dequant_f16 / iq_dequant_f32 / iq_embed_rows).
+bool iq_dequant_supported(int ggml_type) noexcept;
 /// Bytes of one row of `n` values of `ggml_type` (n a multiple of the type's block).
 size_t iq_row_bytes(int ggml_type, int64_t n) noexcept;
 
@@ -80,6 +82,38 @@ void iq_dequant_gu_f16_mixed(int gate_type, int up_type, const void* gate, const
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 
+/// GP100 K-Major SoA expert repacking: true when this layer's gate/up or down matrix has an SoA kernel.
+bool iq_expert_soa_eligible(const NativeExpertLayout& L) noexcept;
+bool iq_gu_soa_eligible(const NativeExpertLayout& L) noexcept;
+bool iq_dn_soa_eligible(const NativeExpertLayout& L) noexcept;
+/// Repack one expert blob on the device from row-major GGUF layout to GP100 K-Major SoA layout in-place
+/// (using `scratch_dev` of at least `L.bytes` bytes as temporary staging on `stream`).
+void iq_repack_expert_blob_soa(const NativeExpertLayout& L, uint8_t* blob_dev, uint8_t* scratch_dev, void* stream);
+/// Fast GP100 K-Major SoA -> FP16 dequantizers for zero-PCIe VRAM-resident prefill.
+void iq_dequant_gu_f16_soa(int gu_type, const void* blob_dev, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream);
+void iq_dequant_dn_f16_soa(int d_type, const void* dn_dev, int64_t n_embd, int64_t n_ff, uint16_t* dst, void* stream);
+/// Direct fused GP100 K-Major SoA HFMA2 grouped prefill MoE (replaces 512x dequant + 512x cuBLAS with 1 launch!).
+void iq_prefill_gu_soa_grouped(int gu_type, const unsigned long long* exp_ptr, const int32_t* exp_off, int n_exp,
+                               int64_t n_ff, int64_t n_embd, const uint16_t* xs_f16, float* gu_out, void* stream);
+void iq_prefill_dn_soa_grouped(int d_type, const unsigned long long* exp_ptr, const int32_t* exp_off, int n_exp,
+                               int64_t n_embd, int64_t n_ff, const uint16_t* hh_f16, float* dm_out, void* stream);
+
+/// GP100 128x64 HFMA2 tiled grouped prefill MoE (both VRAM SoA and RAM-staged AoS GGUF experts, zero cuBLAS!).
+struct alignas(16) IqPrefillTile {
+    int32_t exp;
+    int32_t tok0;
+    int32_t ntok;
+    int32_t pad;
+};
+bool iq_prefill_gu_tiled_supported(int gu_type) noexcept;
+bool iq_prefill_dn_tiled_supported(int d_type) noexcept;
+void iq_prefill_gu_tiled_grouped(int gu_type, bool is_soa, const unsigned long long* exp_ptr,
+                                 const IqPrefillTile* tiles, int n_tiles, int64_t n_ff, int64_t n_embd, size_t up_off,
+                                 const uint16_t* xs_f16, float* gu_out, void* stream);
+void iq_prefill_dn_tiled_grouped(int d_type, bool is_soa, const unsigned long long* exp_ptr,
+                                 const IqPrefillTile* tiles, int n_tiles, int64_t n_embd, int64_t n_ff,
+                                 const uint16_t* hh_f16, float* dm_out, void* stream);
+
 /// Grouped experts in the native format: group g's blob at device address grp_ptr[g]; its entries
 /// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s q8_1 activation (n_embd/32 blocks per token in x_q8_1)
 /// and write row ent_dst[e] of `out` (n_embd floats).  Counts are read on the device.  swiglu_limit
@@ -89,6 +123,6 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           float swiglu_limit = std::numeric_limits<float>::infinity());
+                           float swiglu_limit = std::numeric_limits<float>::infinity(), bool soa = false);
 
 }  // namespace strata::kernels

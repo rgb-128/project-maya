@@ -23,8 +23,21 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
 /// the two calls, without reading R back.
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream);
+/// Fused FP16 hyper-connection norm + inject dot product: computes rs, FP16 xn_h [T, 10240], and inj [T, 4] in one
+/// pass over R (eliminates bf16_to_f16 and cuBLAS wi GEMM when hc_down is native Q8_0_SOA_RM).
+void gr_norm_rs_f16_inj(const float* R, const float* w_norm, const uint16_t* w_inj_bf16, float eps, float* rs,
+                        uint16_t* xn_h, float* inj_out, int64_t T, void* stream);
+/// Fused gr_write + next half's FP16 norm + inject dot product (safe when inj_out == inj_prev in-place).
+/// When `t_cnt >= 0`, updates R for all T tokens, but only computes rs/xn_h/inj for token slice `[t_off, t_off + t_cnt)`
+/// (writing rs and xn_h compactly at `[0..t_cnt)` and inj_out at `[t_off..t_off+t_cnt)`).
+void gr_write_norm_rs_f16_inj(float* R, const float* bo, const float* inj_prev, int64_t inj_ld,
+                              const float* w_norm_next, const uint16_t* w_inj_bf16, float eps, float* rs,
+                              uint16_t* xn_h, float* inj_out, int64_t T, void* stream,
+                              int64_t t_off = 0, int64_t t_cnt = -1);
 /// lo16[t, k] = bf16(silu(lo[t, k] / hc))
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream);
+/// lo_h[t, k] = fp16(silu(lo[t, k] / hc)) (direct FP16 for native Q8_0_SOA hc_up, eliminating bf16_to_f16)
+void gr_silu_f16(const float* lo, uint16_t* lo_h, int64_t T, void* stream);
 /// mixed[t, d] = mean_c xn[t, c, d] * sigmoid(gated[t, c, d]); FP32, BF16 and FP16 (either image may be null).
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h = nullptr);
@@ -33,16 +46,20 @@ void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
 
-// ---- GDN (state 128, 16 k heads, 48 v heads, 10240 conv channels, 4 taps)
-/// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, 48 + h])  (ab: [T, 96])
-void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream);
-/// The 4-tap causal conv + SiLU over the chunk (history [C][3] in, updated to the chunk's last three inputs), then
-/// the L2 norm of the q and k heads of every token.  h: [T, C].
-void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream);
+// ---- GDN (state 128, hk k heads, hv v heads, c conv channels, 4 taps)
+/// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, hv + h])  (ab: [T, 2*hv])
+void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream,
+               int64_t hv = 48);
+/// The 4-tap causal conv + SiLU over the chunk (history [c][3] in, updated to the chunk's last three inputs), then
+/// the L2 norm of the q and k heads of every token.  h: [T, c].
+void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream,
+              int64_t c = 10240, int64_t hk = 16);
 /// The recurrence over the chunk, block per value head, state in registers; y[t] = rmsnorm(o) * gamma * sigmoid(z)
 /// (FP32 and FP16 bits: the out projection is quantized).
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream);
+                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
+                    int64_t hk = 16, int64_t hv = 48, int64_t c = 10240,
+                    float* wy_scratch = nullptr, size_t wy_scratch_floats = 0);
 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
@@ -51,39 +68,54 @@ void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream);
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream);
-/// h16[n, r] = fp16(silu(g[n, r]) * u[n, r])   (the shared expert, gate and up separate, width 640)
-void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream);
+/// h16[n, r] = fp16(silu(g[n, r]) * u[n, r])   (the shared expert, gate and up separate, width ff)
+void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t ff = 640);
 /// h16[n, r] = fp16(silu(gu[n, r]) * gu[n, 640 + r])   (the grouped WMMA products' gate|up rows -> FP16 H)
 void swiglu_split(const float* gu, uint16_t* h16, int64_t n, void* stream);
 /// dst[i] = src[i] for n int32s, as a kernel: either side may be mapped host memory, and the copy never waits
 /// behind the copy engine's queue (the prompt path's grouping tables, while the expert stream fills it).
 void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream);
+/// Flush prior device->host mapped writes (__threadfence_system) and store `val` into mapped host word `dst`
+/// so the host can wait on stream completion without calling cudaStreamSynchronize (zero libcuda lock contention).
+void signal_u32(uint32_t* dst, uint32_t val, void* stream);
+/// GPU-side prefill MoE histogram: counts owned routed experts into mapped cnt_out[0..n_expert-1], sets
+/// cnt_out[n_expert] = 1 if any id is out of range, flushes system writes, and signals *sync_dev = target.
+void prefill_route_count(const int32_t* ids, const int8_t* owner_row, int tp_rank, int tp_size, int64_t tk,
+                         int32_t n_expert, int32_t* cnt_out, uint32_t* sync_dev, uint32_t target, void* stream);
+/// GPU-side prefill MoE scatter: reads expert starting offsets off_in[0..n_expert-1] (may be mapped host memory)
+/// and populates slot_dev[0..tk-1] and src_dev[0..owned_rows-1] directly in HBM2 VRAM.
+void prefill_route_scatter(const int32_t* ids, const int8_t* owner_row, int tp_rank, int tp_size, int64_t tk,
+                           int32_t k, int32_t n_expert, const int32_t* off_in, int32_t* slot_dev, int32_t* src_dev,
+                           void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
+/// y[t] = sum_{k=0}^{K-1} bf16(X[t, k]) * bf16(w[k]) in FP32 (replaces N=1 cuBLAS shared-gate GEMM with zero host mutex!).
+void bf16_dot_row(const uint16_t* X, const uint16_t* w, float* y, int64_t T, int64_t K, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream);
 /// NEOX rotary on the first 64 dims of each head: x [T, heads, dim] at positions pos0 + t.
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, float freq_base, void* stream);
-/// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256]
-void split_q(const float* q_full, float* q, int64_t T, void* stream);
+/// q_full [T, nh, 512] (q | gate per head) -> q [T, nh, 256]
+void split_q(const float* q_full, float* q, int64_t T, void* stream, int64_t nh = 24);
 /// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
-void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream);
+void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t nh = 24);
 
 /// K and V of T consecutive cells (positions pos0..pos0+T-1; K normed and rotated) into the paged pools: FP16
 /// (`k_pool`/`v_pool`) or INT8 codes + FP16 scale per 64 (`k_q`...), the decode append's arithmetic.
-/// K, V: [T, 2, 256].
+/// K, V: [T, nkv, 256].
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
                void* stream, const strata::kernels::KvHostPools* host = nullptr,
-               const strata::kernels::KvHostPools* stage = nullptr);
+               const strata::kernels::KvHostPools* stage = nullptr, int64_t nkv = 2);
 
 /// fp32 -> fp16 bits and fp32 -> bf16, n elements (the two activation images of the prompt GEMMs).
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
+void bf16_to_f16(const uint16_t* x, uint16_t* y, int64_t n, void* stream);
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream);
 /// y = fp32(fp16(x)): what an FP16 store of x would read back (the FP16 indexer-key experiment)
 void round_f16(const float* x, float* y, int64_t n, void* stream);

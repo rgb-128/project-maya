@@ -24,9 +24,25 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <linux/mman.h>
+#include <sched.h>
 #ifndef MAP_HUGE_2MB
 #define MAP_HUGE_2MB (21 << 26)
+#endif
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifndef MPOL_INTERLEAVE
+#define MPOL_INTERLEAVE 3
+#endif
+#ifndef MPOL_MF_STRICT
+#define MPOL_MF_STRICT (1u << 0)
+#endif
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE (1u << 1)
 #endif
 #endif
 
@@ -91,10 +107,17 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
         note = "hugetlb 2 MB pages";
         return p;
     }
-    note = "MAP_HUGETLB unavailable (no hugetlb pool configured?); using 4 KB pages";
+    note = "MAP_HUGETLB unavailable; using THP 2 MB hugepages";
     p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p != MAP_FAILED) {
+#ifdef MADV_HUGEPAGE
+        (void) madvise(p, bytes, MADV_HUGEPAGE);
+#endif
+        got = PageBacking::NormalPages;
+        return p;
+    }
     got = PageBacking::NormalPages;
-    return p == MAP_FAILED ? nullptr : p;
+    return nullptr;
 #endif
 }
 
@@ -138,9 +161,96 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
 }
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
-                         uint64_t max_pinned_bytes) : capacity(bytes) {
+                         uint64_t max_pinned_bytes, int bind_node) : capacity(bytes) {
     if (bytes == 0) return;
     base = reserve(bytes, backing, note);
+
+#if defined(__linux__) && defined(SYS_mbind)
+    // 2-socket NUMA arena placement:
+    //   bind_node >= 0             : Explicit MPOL_BIND to a single NUMA node (for dual-socket mirrored 0-QPI arena!)
+    //   MAYA_ARENA_NUMA=interleave : MPOL_INTERLEAVE across Node 0+1 (8-channel DDR3 = 2x CPU expert bandwidth!)
+    //   MAYA_ARENA_NUMA=1 (default): Zero-QPI 2-node split (L0..23 -> Node 0 for GPU 0/1; L24..47 -> Node 1 for GPU 2/3)
+    //   MAYA_ARENA_NUMA=0          : disabled
+    if (base && bind_node >= 0) {
+        char npath[64];
+        std::snprintf(npath, sizeof npath, "/sys/devices/system/node/node%d", bind_node);
+        struct stat stn{};
+        if (::stat(npath, &stn) == 0) {
+            unsigned long mask = 1ul << (unsigned) bind_node;
+            const long r = ::syscall(SYS_mbind, base, (size_t) bytes, MPOL_BIND, &mask, 64ul, MPOL_MF_STRICT | MPOL_MF_MOVE);
+            if (r == 0) {
+                const uint64_t nthr = 8;
+                const uint64_t step = ((bytes / nthr) + (2ull << 20) - 1) & ~((2ull << 20) - 1);
+                std::vector<std::thread> ts;
+                for (uint64_t t = 0; t < nthr; ++t) {
+                    const uint64_t a = t * step;
+                    if (a >= bytes) break;
+                    const uint64_t len = std::min(step, bytes - a);
+                    ts.emplace_back([ptr = (uint8_t*) base + a, len]() {
+                        for (uint64_t o = 0; o < len; o += 4096) ptr[o] = 0;
+                    });
+                }
+                for (auto& th : ts) th.join();
+                char nbuf[96];
+                std::snprintf(nbuf, sizeof nbuf, "NUMA node%d MPOL_BIND (%.1fG 0-QPI); ",
+                              bind_node, (double) bytes / 1073741824.0);
+                note = std::string(nbuf) + note;
+            }
+        }
+    } else if (base && bounds.size() >= 4) {
+        const char* nu = std::getenv("MAYA_ARENA_NUMA");
+        struct stat st1{};
+        const bool interleave = (nu != nullptr && std::strcmp(nu, "interleave") == 0);
+        const bool enabled = (nu == nullptr || interleave || std::atoi(nu) != 0);
+        if (enabled && ::stat("/sys/devices/system/node/node1", &st1) == 0) {
+            if (interleave) {
+                unsigned long m01 = (1ul << 0) | (1ul << 1);
+                const long r = ::syscall(SYS_mbind, base, (size_t) bytes, MPOL_INTERLEAVE, &m01, 64ul, MPOL_MF_STRICT | MPOL_MF_MOVE);
+                if (r == 0) {
+                    const uint64_t half = (bytes / 2) & ~((2ull << 20) - 1);
+                    auto touch = [](uint8_t* ptr, uint64_t len) {
+                        for (uint64_t o = 0; o < len; o += 4096) ptr[o] = 0;
+                    };
+                    std::thread t0(touch, (uint8_t*) base, half);
+                    std::thread t1(touch, (uint8_t*) base + half, bytes - half);
+                    t0.join();
+                    t1.join();
+                    char nbuf[128];
+                    std::snprintf(nbuf, sizeof nbuf, "NUMA 2-node MPOL_INTERLEAVE (%.1fG 8-ch DDR3); ",
+                                  (double) bytes / 1073741824.0);
+                    note = std::string(nbuf) + note;
+                }
+            } else {
+                size_t mid_l = (bounds.size() - 1) / 2;
+                if (const char* sv = std::getenv("MAYA_NUMA_SPLIT_LAYER")) {
+                    const long v = std::atol(sv);
+                    if (v > 0 && (size_t) v < bounds.size() - 1) mid_l = (size_t) v;
+                }
+                const uint64_t align2m = 2ull << 20;
+                const uint64_t split_off = (bounds[mid_l] & ~(align2m - 1));
+                if (split_off >= align2m && split_off + align2m <= bytes) {
+                    unsigned long m0 = 1ul << 0;
+                    unsigned long m1 = 1ul << 1;
+                    const long r0 = ::syscall(SYS_mbind, base, (size_t) split_off, MPOL_BIND, &m0, 64ul, MPOL_MF_STRICT | MPOL_MF_MOVE);
+                    const long r1 = ::syscall(SYS_mbind, (uint8_t*) base + split_off, (size_t) (bytes - split_off), MPOL_BIND, &m1, 64ul, MPOL_MF_STRICT | MPOL_MF_MOVE);
+                    if (r0 == 0 && r1 == 0) {
+                        auto touch = [](uint8_t* ptr, uint64_t len) {
+                            for (uint64_t o = 0; o < len; o += 4096) ptr[o] = 0;
+                        };
+                        std::thread t0(touch, (uint8_t*) base, split_off);
+                        std::thread t1(touch, (uint8_t*) base + split_off, bytes - split_off);
+                        t0.join();
+                        t1.join();
+                        char nbuf[128];
+                        std::snprintf(nbuf, sizeof nbuf, "NUMA 2-node mbind @L%zu (%.1fG N0 / %.1fG N1); ",
+                                      mid_l, (double) split_off / 1073741824.0, (double) (bytes - split_off) / 1073741824.0);
+                        note = std::string(nbuf) + note;
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.

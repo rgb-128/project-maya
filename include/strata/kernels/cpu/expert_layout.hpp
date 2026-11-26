@@ -26,6 +26,14 @@ struct ExpertLayout {
     /// Per layer, the GGUF file (a name beside the --native shard) that holds its experts when the model's
     /// shards split the layers (Swift's GGUFs: layers 13-47 in shard 2).  Empty = the --native shard itself.
     std::vector<std::string> gguf_file;
+    /// v4: per (layer, role) GGUF file (3 * n_layers: 0=gate, 1=up, 2=down) when one layer straddles shards.
+    std::vector<std::string> gguf_role_file;
+    std::string role_file(int64_t layer, int role) const {
+        if (gguf_role_file.size() == (size_t) (3 * n_layers) && !gguf_role_file[(size_t) (3 * layer + role)].empty())
+            return gguf_role_file[(size_t) (3 * layer + role)];
+        if ((size_t) layer < gguf_file.size()) return gguf_file[(size_t) layer];
+        return std::string();
+    }
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size
 
@@ -43,6 +51,8 @@ struct ExpertLayout {
 bool cpu_avx512_ok();
 /// AVX2 + FMA, with the OS saving the YMM state (the AVX2 kernels' gate).
 bool cpu_avx2_ok();
+/// Ivy Bridge AVX1 + F16C + SSSE3 + SSE4.1 (Q4_K / Q5_1 / Q8_0 tiled CPU kernels).
+bool cpu_avx1_f16c_ok() noexcept;
 /// AVX-512 F, BW, VL and DQ with the OS saving the state: what iq_avx512.cpp's kernels need to run (no VNNI or
 /// VBMI).  The engine still picks them only where cpu_avx512_ok() (faster than AVX-2 there); tests run them on any
 /// such CPU.  MAYA_FORCE_AVX2=1 answers no.

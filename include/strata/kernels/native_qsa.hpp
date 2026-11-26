@@ -21,10 +21,19 @@ bool native_qsa_enabled();
 void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float* output,
                                   int n_cols, int n_rows, float epsilon, void* stream);
 
+// Strided input variant (e.g. q_full with in_stride = 2*head_dim -> contiguous q_cur with stride head_dim).
+// Eliminates cudaMemcpy2DAsync q/gate split while keeping bit-identical RMS norm math.
+void native_qsa_rms_norm_weighted_strided(const float* input, int in_stride, const float* gamma, float* output,
+                                          int n_cols, int n_rows, float epsilon, void* stream);
+
 // attn/output [head_dim,n_head]; q_full [2*head_dim,n_head], each row is
 // [query channels, gate channels]. Output is attn*sigmoid(second-half gate).
 // Exact output==attn is supported; all other spans must be disjoint.
 void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,
                            int n_head, int head_dim, void* stream);
+
+// Wave 6: Fused attn*sigmoid(gate) -> direct Q8_1 output (skips FP32 write/read & 12 quantize launches/window).
+void native_qsa_gate_apply_q8_1(const float* attn, const float* q_full, void* y_q8,
+                                int n_head, int head_dim, void* stream);
 
 } // namespace strata::kernels

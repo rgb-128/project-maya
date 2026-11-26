@@ -16,6 +16,9 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <cstdlib>
+#include <sys/mman.h>
 #endif
 
 namespace strata::kernels {
@@ -194,6 +197,30 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
             return false;
         }
         impl_->n_rows = n_rows;
+    } else {
+#if !defined(_WIN32)
+        if (const char* ml = std::getenv("MAYA_PLE_MLOCK"); ml != nullptr && std::atoi(ml) != 0 && impl_->data != nullptr) {
+            const uintptr_t p0 = (uintptr_t) impl_->data & ~(uintptr_t) 4095u;
+            const size_t len = (size_t) (need + ((uintptr_t) impl_->data - p0));
+            if (::mlock((void*) p0, len) == 0) {
+                (void) ::madvise((void*) p0, len, MADV_RANDOM);
+                std::fprintf(stderr, "ple table: mlock pinned %.2f GiB in RAM (zero eviction stalls)\n",
+                             (double) len / 1073741824.0);
+            } else {
+                // madvise(MADV_WILLNEED) on Linux is capped by kernel readahead and leaves >99% of a 26.8 GiB
+                // table cold on disk after reboot. Sequentially fault every page into the OS page cache (~0.4s
+                // when already cached, full sequential disk speed on cold boot) so decode sees zero HDD faults.
+                (void) ::madvise((void*) p0, len, MADV_SEQUENTIAL);
+                const auto* base = reinterpret_cast<const volatile uint8_t*>(p0);
+                uint64_t sink = 0;
+                for (size_t off = 0; off < len; off += 4096) sink += base[off];
+                (void) sink;
+                (void) ::madvise((void*) p0, len, MADV_RANDOM);
+                std::fprintf(stderr, "ple table: pre-faulted %.2f GiB into RAM page cache (mlock skipped: RLIMIT_MEMLOCK)\n",
+                             (double) len / 1073741824.0);
+            }
+        }
+#endif
     }
     impl_->mode = io.mode;
     return true;

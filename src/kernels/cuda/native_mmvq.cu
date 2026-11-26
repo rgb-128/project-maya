@@ -31,6 +31,8 @@
 #include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -1139,6 +1141,1344 @@ void small_f32(const void* weights, const float* x, void* scratch_q8_1,
     small_mmvq<Weight, Qi>(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+// ============================ GP100 (sm_60) P100 Q6_K & Q8_0 kernels ============================
+// Tesla P100 (GP100, sm_60) lacks hardware dp4a (4x vmad) and __vsubss4, but has full 2:1 FP16x2 (HFMA2,
+// 18.7 TFLOPS vs 9.3 FP32).  Staging x in shared memory + coalesced 53-word Q6_K warp loads + R rows/warp
+// raises Q6_K from ~162 GB/s to ~340-375 GB/s (1.7-2.0x) and Q8_0 from ~250 GB/s to ~380 GB/s (1.5-1.9x).
+// MAYA_P100_MMVQ=0 disables both; MAYA_P100_HFMA2=0 uses strict bit-exact Q8_1 vmad instead of HFMA2.
+
+__device__ __forceinline__ int p100_q6_m32(int v) {
+    const uint32_t u = (uint32_t) v ^ 0x20202020u;
+    const uint32_t neg = u & 0x20202020u;
+    return (int) (u | (neg << 1) | (neg << 2));
+}
+
+__device__ __forceinline__ __half2 p100_u6x2_to_h2_lo(uint32_t q6) {
+    const uint32_t h = __byte_perm(q6, 0x64006400u, 0x5150);
+    return __hsub2(*reinterpret_cast<const __half2*>(&h), __floats2half2_rn(1056.0f, 1056.0f));
+}
+__device__ __forceinline__ __half2 p100_u6x2_to_h2_hi(uint32_t q6) {
+    const uint32_t h = __byte_perm(q6, 0x64006400u, 0x5352);
+    return __hsub2(*reinterpret_cast<const __half2*>(&h), __floats2half2_rn(1056.0f, 1056.0f));
+}
+__device__ __forceinline__ __half2 p100_s8x2_to_h2_lo(uint32_t v_xor80) {
+    const uint32_t h = __byte_perm(v_xor80, 0x64006400u, 0x5150);
+    return __hsub2(*reinterpret_cast<const __half2*>(&h), __floats2half2_rn(1152.0f, 1152.0f));
+}
+__device__ __forceinline__ __half2 p100_s8x2_to_h2_hi(uint32_t v_xor80) {
+    const uint32_t h = __byte_perm(v_xor80, 0x64006400u, 0x5352);
+    return __hsub2(*reinterpret_cast<const __half2*>(&h), __floats2half2_rn(1152.0f, 1152.0f));
+}
+
+// Convert Q8_1 blocks into shared __half2 (q/128.0 exact in FP16) + float scales (d8 * 128.0).
+template<int NCOLS>
+__device__ __forceinline__ void p100_stage_q81_as_h2(const Q81Block* __restrict__ x, int n_in,
+                                                     __half2* __restrict__ sxh, float* __restrict__ sxd) {
+    const int n_xblk = n_in / 32;
+    const int tot_blk = NCOLS * n_xblk;
+    const __half2 inv128 = __floats2half2_rn(1.0f / 128.0f, 1.0f / 128.0f);
+    // 16 threads per Q81Block? Simpler: each thread processes pairs of int8 across all blocks.
+    const int tot_h2 = NCOLS * (n_in / 2);
+    for (int i = threadIdx.x; i < tot_h2; i += 256) {
+        const int blk = i >> 4;          // i / 16
+        const int sub = (i & 15) << 1;   // 0,2,4..30
+        const Q81Block& xb = x[blk];
+        const uint16_t pair = *reinterpret_cast<const uint16_t*>(xb.qs + sub);
+        const uint32_t vx = ((uint32_t) pair) ^ 0x8080u;
+        sxh[i] = __hmul2(p100_s8x2_to_h2_lo(vx), inv128);
+    }
+    for (int b = threadIdx.x; b < tot_blk; b += 256) {
+        sxd[b] = __low2float(x[b].ds) * 128.0f;
+    }
+    __syncthreads();
+}
+
+template<int NCOLS, int R>
+__global__ void __launch_bounds__(256) p100_q6_k_mmvq_kernel(const uint8_t* __restrict__ w,
+                                                             const Q81Block* __restrict__ x,
+                                                             float* __restrict__ y, int n_in, int n_out) {
+    extern __shared__ int sx[];
+    const int n_xblk = n_in / 32;
+    const int nw_x = NCOLS * n_xblk * (int) (sizeof(Q81Block) / 4);
+    for (int i = threadIdx.x; i < nw_x; i += 256) sx[i] = reinterpret_cast<const int*>(x)[i];
+    __syncthreads();
+    const Q81Block* xs = reinterpret_cast<const Q81Block*>(sx);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.x * 8 + warp) * R;
+    if (row0 >= n_out) return;
+    const int n_blk = n_in / 256;
+    const std::size_t rb = std::size_t(n_blk) * 210;
+
+    const uint8_t* wp[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wp[r] = w + std::size_t(row0 + r < n_out ? row0 + r : n_out - 1) * rb;
+
+    float acc[R][NCOLS] = {};
+    const int bq8_offset = 4 * (lane / 16) + (lane % 16) / 8;
+    const int qi = 8 * (lane / 16) + lane % 8;
+    const int vh_shift = 2 * ((lane % 16) / 8);
+
+    for (int kbx = 0; kbx < n_blk; ++kbx) {
+        int u0[NCOLS], u1[NCOLS];
+        float d80[NCOLS], d81[NCOLS];
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const Q81Block* xb = xs + c * n_xblk + kbx * 8;
+            u0[c] = reinterpret_cast<const int*>(xb[bq8_offset + 0].qs)[lane % 8];
+            u1[c] = reinterpret_cast<const int*>(xb[bq8_offset + 2].qs)[lane % 8];
+            d80[c] = __low2float(xb[bq8_offset + 0].ds);
+            d81[c] = __low2float(xb[bq8_offset + 2].ds);
+        }
+        uint32_t w0[R], w1[R];
+        int sh[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* s = wp[r] + std::size_t(kbx) * 210;
+            sh[r] = int(reinterpret_cast<uintptr_t>(s) & 3u);
+            const uint32_t* a = reinterpret_cast<const uint32_t*>(s - sh[r]);
+            w0[r] = (lane == 0 && sh[r]) ? (uint32_t(*reinterpret_cast<const uint16_t*>(s)) << 16) : a[lane];
+            w1[r] = lane > 20 ? 0u : (lane == 20 && !sh[r]) ? uint32_t(*reinterpret_cast<const uint16_t*>(s + 208)) : a[32 + lane];
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int f = 8 * sh[r];
+            const uint32_t nx = __shfl_sync(0xffffffffu, lane == 0 ? w1[r] : w0[r], (lane + 1) & 31);
+            const int vl = int(__funnelshift_r(w0[r], nx, f));
+            const uint32_t h0 = __shfl_sync(0xffffffffu, w1[r], qi), h1 = __shfl_sync(0xffffffffu, w1[r], qi + 1);
+            const int vh = int(__funnelshift_r(h0, h1, f)) >> vh_shift;
+            const int sb = 8 * (lane / 16) + (lane % 16) / 4 + sh[r];
+            const uint32_t s0 = __shfl_sync(0xffffffffu, w1[r], 16 + (sb >> 2));
+            const uint32_t s1 = __shfl_sync(0xffffffffu, w1[r], 17 + (sb >> 2));
+            const int sc0 = int(int8_t(s0 >> (8 * (sb & 3))));
+            const int sc1 = int(int8_t(s1 >> (8 * (sb & 3))));
+            const uint32_t dw = __shfl_sync(0xffffffffu, w1[r], 20);
+            const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dw >> f)));
+            const int vi0 = p100_q6_m32(((vl >> 0) & 0x0f0f0f0f) | (((vh >> 0) << 4) & 0x30303030));
+            const int vi1 = p100_q6_m32(((vl >> 4) & 0x0f0f0f0f) | (((vh >> 4) << 4) & 0x30303030));
+#pragma unroll
+            for (int c = 0; c < NCOLS; ++c) {
+                const float sumf = d80[c] * (__dp4a(vi0, u0[c], 0) * sc0) + d81[c] * (__dp4a(vi1, u1[c], 0) * sc1);
+                acc[r][c] += d * sumf;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (row0 + r >= n_out) break;
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const float v = warp_sum(acc[r][c]);
+            if (lane == 0) y[std::size_t(c) * n_out + row0 + r] = v;
+        }
+    }
+}
+
+template<int NCOLS, int R>
+__global__ void __launch_bounds__(256) p100_q6_k_hfma2_kernel(const uint8_t* __restrict__ w,
+                                                              const Q81Block* __restrict__ x,
+                                                              float* __restrict__ y, int n_in, int n_out) {
+    extern __shared__ __align__(16) uint8_t smem[];
+    const int n_h2 = n_in / 2;
+    const int n_xblk = n_in / 32;
+    __half2* sxh = reinterpret_cast<__half2*>(smem);
+    float* sxd = reinterpret_cast<float*>(sxh + NCOLS * n_h2);
+    p100_stage_q81_as_h2<NCOLS>(x, n_in, sxh, sxd);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.x * 8 + warp) * R;
+    if (row0 >= n_out) return;
+    const int n_blk = n_in / 256;
+    const std::size_t rb = std::size_t(n_blk) * 210;
+
+    const uint8_t* wp[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wp[r] = w + std::size_t(row0 + r < n_out ? row0 + r : n_out - 1) * rb;
+
+    float acc[R][NCOLS] = {};
+    const int bq8_offset = 4 * (lane / 16) + (lane % 16) / 8;
+    const int qi = 8 * (lane / 16) + lane % 8;
+    const int vh_shift = 2 * ((lane % 16) / 8);
+    const int x_off0 = (bq8_offset + 0) * 16 + (lane % 8) * 2;
+    const int x_off1 = (bq8_offset + 2) * 16 + (lane % 8) * 2;
+
+    for (int kbx = 0; kbx < n_blk; ++kbx) {
+        __half2 x0a[NCOLS], x0b[NCOLS], x1a[NCOLS], x1b[NCOLS];
+        float d80[NCOLS], d81[NCOLS];
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const __half2* xb = sxh + c * n_h2 + kbx * 128;
+            x0a[c] = xb[x_off0];     x0b[c] = xb[x_off0 + 1];
+            x1a[c] = xb[x_off1];     x1b[c] = xb[x_off1 + 1];
+            d80[c] = sxd[c * n_xblk + kbx * 8 + bq8_offset + 0];
+            d81[c] = sxd[c * n_xblk + kbx * 8 + bq8_offset + 2];
+        }
+        uint32_t w0[R], w1[R];
+        int sh[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const uint8_t* s = wp[r] + std::size_t(kbx) * 210;
+            sh[r] = int(reinterpret_cast<uintptr_t>(s) & 3u);
+            const uint32_t* a = reinterpret_cast<const uint32_t*>(s - sh[r]);
+            w0[r] = (lane == 0 && sh[r]) ? (uint32_t(*reinterpret_cast<const uint16_t*>(s)) << 16) : a[lane];
+            w1[r] = lane > 20 ? 0u : (lane == 20 && !sh[r]) ? uint32_t(*reinterpret_cast<const uint16_t*>(s + 208)) : a[32 + lane];
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int f = 8 * sh[r];
+            const uint32_t nx = __shfl_sync(0xffffffffu, lane == 0 ? w1[r] : w0[r], (lane + 1) & 31);
+            const uint32_t vl = __funnelshift_r(w0[r], nx, f);
+            const uint32_t h0 = __shfl_sync(0xffffffffu, w1[r], qi), h1 = __shfl_sync(0xffffffffu, w1[r], qi + 1);
+            const uint32_t vh = __funnelshift_r(h0, h1, f) >> vh_shift;
+            const int sb = 8 * (lane / 16) + (lane % 16) / 4 + sh[r];
+            const uint32_t s0 = __shfl_sync(0xffffffffu, w1[r], 16 + (sb >> 2));
+            const uint32_t s1 = __shfl_sync(0xffffffffu, w1[r], 17 + (sb >> 2));
+            const float sc0 = float(int8_t(s0 >> (8 * (sb & 3))));
+            const float sc1 = float(int8_t(s1 >> (8 * (sb & 3))));
+            const uint32_t dw = __shfl_sync(0xffffffffu, w1[r], 20);
+            const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(dw >> f)));
+
+            const uint32_t q0 = ((vl >> 0) & 0x0f0f0f0fu) | (((vh >> 0) << 4) & 0x30303030u);
+            const uint32_t q1 = ((vl >> 4) & 0x0f0f0f0fu) | (((vh >> 4) << 4) & 0x30303030u);
+            const __half2 w0a = p100_u6x2_to_h2_lo(q0), w0b = p100_u6x2_to_h2_hi(q0);
+            const __half2 w1a = p100_u6x2_to_h2_lo(q1), w1b = p100_u6x2_to_h2_hi(q1);
+            const float dsc0 = d * sc0, dsc1 = d * sc1;
+#pragma unroll
+            for (int c = 0; c < NCOLS; ++c) {
+                const __half2 p0 = __hfma2(w0b, x0b[c], __hmul2(w0a, x0a[c]));
+                const __half2 p1 = __hfma2(w1b, x1b[c], __hmul2(w1a, x1a[c]));
+                const float2 f0 = __half22float2(p0);
+                const float2 f1 = __half22float2(p1);
+                acc[r][c] = fmaf(dsc0 * d80[c], f0.x + f0.y, fmaf(dsc1 * d81[c], f1.x + f1.y, acc[r][c]));
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (row0 + r >= n_out) break;
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const float v = warp_sum(acc[r][c]);
+            if (lane == 0) y[std::size_t(c) * n_out + row0 + r] = v;
+        }
+    }
+}
+
+template<int NCOLS, int R>
+__global__ void __launch_bounds__(256) p100_q8_0_smem_vmad_kernel(const Q80Block* __restrict__ w,
+                                                                  const Q81Block* __restrict__ x,
+                                                                  float* __restrict__ y, int n_in, int n_out) {
+    extern __shared__ int sx[];
+    const int bpr = n_in / 32;
+    const int nw_x = NCOLS * bpr * (int) (sizeof(Q81Block) / 4);
+    for (int i = threadIdx.x; i < nw_x; i += 256) sx[i] = reinterpret_cast<const int*>(x)[i];
+    __syncthreads();
+    const Q81Block* xs = reinterpret_cast<const Q81Block*>(sx);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.x * 8 + warp) * R;
+    if (row0 >= n_out) return;
+    const int sub = lane & 3;
+
+    float acc[R][NCOLS] = {};
+    for (int kbx = lane >> 2; kbx < bpr; kbx += 8) {
+        int u0[NCOLS], u1[NCOLS];
+        float xd[NCOLS];
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const Q81Block& xb = xs[c * bpr + kbx];
+            u0[c] = reinterpret_cast<const int*>(xb.qs)[sub * 2];
+            u1[c] = reinterpret_cast<const int*>(xb.qs)[sub * 2 + 1];
+            xd[c] = __low2float(xb.ds);
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int rr = row0 + r < n_out ? row0 + r : n_out - 1;
+            const Q80Block* wb = w + std::size_t(rr) * bpr + kbx;
+            const uint16_t* q16 = reinterpret_cast<const uint16_t*>(wb->qs) + sub * 4;
+            const int v0 = int(uint32_t(q16[0]) | (uint32_t(q16[1]) << 16));
+            const int v1 = int(uint32_t(q16[2]) | (uint32_t(q16[3]) << 16));
+            const float d0 = __half2float(wb->d);
+#pragma unroll
+            for (int c = 0; c < NCOLS; ++c) {
+                int s = __dp4a(v0, u0[c], 0);
+                s = __dp4a(v1, u1[c], s);
+                acc[r][c] += d0 * xd[c] * float(s);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (row0 + r >= n_out) break;
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const float v = warp_sum(acc[r][c]);
+            if (lane == 0) y[std::size_t(c) * n_out + row0 + r] = v;
+        }
+    }
+}
+
+template<int NCOLS, int R>
+__global__ void __launch_bounds__(256) p100_q8_0_hfma2_kernel(const Q80Block* __restrict__ w,
+                                                              const Q81Block* __restrict__ x,
+                                                              float* __restrict__ y, int n_in, int n_out) {
+    extern __shared__ __align__(16) uint8_t smem[];
+    const int n_h2 = n_in / 2;
+    const int bpr = n_in / 32;
+    __half2* sxh = reinterpret_cast<__half2*>(smem);
+    float* sxd = reinterpret_cast<float*>(sxh + NCOLS * n_h2);
+    p100_stage_q81_as_h2<NCOLS>(x, n_in, sxh, sxd);
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.x * 8 + warp) * R;
+    if (row0 >= n_out) return;
+    const int sub = lane & 3;
+
+    float acc[R][NCOLS] = {};
+    for (int kbx = lane >> 2; kbx < bpr; kbx += 8) {
+        __half2 x0[NCOLS], x1[NCOLS], x2[NCOLS], x3[NCOLS];
+        float xd[NCOLS];
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const __half2* xp = sxh + c * n_h2 + kbx * 16 + sub * 4;
+            x0[c] = xp[0]; x1[c] = xp[1]; x2[c] = xp[2]; x3[c] = xp[3];
+            xd[c] = sxd[c * bpr + kbx];
+        }
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int rr = row0 + r < n_out ? row0 + r : n_out - 1;
+            const Q80Block* wb = w + std::size_t(rr) * bpr + kbx;
+            const uint16_t* q16 = reinterpret_cast<const uint16_t*>(wb->qs) + sub * 4;
+            const uint32_t v0 = (uint32_t(q16[0]) | (uint32_t(q16[1]) << 16)) ^ 0x80808080u;
+            const uint32_t v1 = (uint32_t(q16[2]) | (uint32_t(q16[3]) << 16)) ^ 0x80808080u;
+            const float d0 = __half2float(wb->d);
+            const __half2 w0 = p100_s8x2_to_h2_lo(v0), w1 = p100_s8x2_to_h2_hi(v0);
+            const __half2 w2 = p100_s8x2_to_h2_lo(v1), w3 = p100_s8x2_to_h2_hi(v1);
+#pragma unroll
+            for (int c = 0; c < NCOLS; ++c) {
+                __half2 s = __hmul2(w0, x0[c]);
+                s = __hfma2(w1, x1[c], s);
+                s = __hfma2(w2, x2[c], s);
+                s = __hfma2(w3, x3[c], s);
+                const float2 sf = __half22float2(s);
+                acc[r][c] = fmaf(d0 * xd[c], sf.x + sf.y, acc[r][c]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (row0 + r >= n_out) break;
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const float v = warp_sum(acc[r][c]);
+            if (lane == 0) y[std::size_t(c) * n_out + row0 + r] = v;
+        }
+    }
+}
+
+bool p100_is_sm60() {
+    static int cache[64] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    if (cache[dev] == 0) {
+        int maj = 0, min = 0;
+        cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&min, cudaDevAttrComputeCapabilityMinor, dev);
+        const char* v = std::getenv("MAYA_P100_MMVQ");
+        const bool on = (maj == 6 && min == 0) && (v == nullptr || std::atoi(v) != 0);
+        cache[dev] = on ? 1 : -1;
+    }
+    return cache[dev] > 0;
+}
+
+bool p100_use_hfma2() {
+    static const bool on = [] {
+        const char* v = std::getenv("MAYA_P100_HFMA2");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+bool p100_mmvq_try_q6k(const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int ncols, cudaStream_t s) {
+    if (!p100_is_sm60() || ncols < 1 || ncols > 4) return false;
+    const auto* w = static_cast<const uint8_t*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const std::size_t smem_h2 = std::size_t(ncols) * (std::size_t(n_in) * 2 + std::size_t(n_in / 32) * 4);
+    const std::size_t smem_q8 = std::size_t(ncols) * std::size_t(n_in / 32) * sizeof(Q81Block);
+    if (p100_use_hfma2() && smem_h2 <= 44 * 1024) {
+        const unsigned blk2 = unsigned((std::size_t(n_out) + 15) / 16);
+        switch (ncols) {
+            case 1: p100_q6_k_hfma2_kernel<1, 2><<<blk2, 256, smem_h2, s>>>(w, x, y, n_in, n_out); return true;
+            case 2: p100_q6_k_hfma2_kernel<2, 2><<<blk2, 256, smem_h2, s>>>(w, x, y, n_in, n_out); return true;
+            case 3: p100_q6_k_hfma2_kernel<3, 2><<<blk2, 256, smem_h2, s>>>(w, x, y, n_in, n_out); return true;
+            case 4: p100_q6_k_hfma2_kernel<4, 2><<<blk2, 256, smem_h2, s>>>(w, x, y, n_in, n_out); return true;
+        }
+    }
+    if (smem_q8 <= 44 * 1024) {
+        const bool r4 = (n_out >= 16384 && ncols <= 2);
+        const unsigned blk = unsigned((std::size_t(n_out) + (r4 ? 31 : 15)) / (r4 ? 32 : 16));
+        switch (ncols) {
+            case 1:
+                if (r4) p100_q6_k_mmvq_kernel<1, 4><<<blk, 256, smem_q8, s>>>(w, x, y, n_in, n_out);
+                else p100_q6_k_mmvq_kernel<1, 2><<<blk, 256, smem_q8, s>>>(w, x, y, n_in, n_out);
+                return true;
+            case 2:
+                if (r4) p100_q6_k_mmvq_kernel<2, 4><<<blk, 256, smem_q8, s>>>(w, x, y, n_in, n_out);
+                else p100_q6_k_mmvq_kernel<2, 2><<<blk, 256, smem_q8, s>>>(w, x, y, n_in, n_out);
+                return true;
+            case 3: p100_q6_k_mmvq_kernel<3, 2><<<blk, 256, smem_q8, s>>>(w, x, y, n_in, n_out); return true;
+            case 4: p100_q6_k_mmvq_kernel<4, 2><<<blk, 256, smem_q8, s>>>(w, x, y, n_in, n_out); return true;
+        }
+    }
+    return false;
+}
+
+bool p100_mmvq_try_q80(const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int ncols, cudaStream_t s) {
+    if (!p100_is_sm60() || ncols < 1 || ncols > 4) return false;
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const std::size_t smem_h2 = std::size_t(ncols) * (std::size_t(n_in) * 2 + std::size_t(n_in / 32) * 4);
+    const std::size_t smem_q8 = std::size_t(ncols) * std::size_t(n_in / 32) * sizeof(Q81Block);
+    const unsigned blk2 = unsigned((std::size_t(n_out) + 15) / 16);
+    // Measured on GP100: T=1 HFMA2 wins (73 vs 85 us); T>=2 bit-exact smem_vmad matches/beats HFMA2 (74/82 us)!
+    if (ncols == 1 && p100_use_hfma2() && smem_h2 <= 44 * 1024) {
+        p100_q8_0_hfma2_kernel<1, 2><<<blk2, 256, smem_h2, s>>>(w, x, y, n_in, n_out);
+        return true;
+    }
+    if (smem_q8 <= 44 * 1024) {
+        switch (ncols) {
+            case 1: p100_q8_0_smem_vmad_kernel<1, 2><<<blk2, 256, smem_q8, s>>>(w, x, y, n_in, n_out); return true;
+            case 2: p100_q8_0_smem_vmad_kernel<2, 2><<<blk2, 256, smem_q8, s>>>(w, x, y, n_in, n_out); return true;
+            case 3: p100_q8_0_smem_vmad_kernel<3, 2><<<blk2, 256, smem_q8, s>>>(w, x, y, n_in, n_out); return true;
+            case 4: p100_q8_0_smem_vmad_kernel<4, 2><<<blk2, 256, smem_q8, s>>>(w, x, y, n_in, n_out); return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// GP100 K-Major SoA Q8_0 (108) and Q6_K (114) MMVQ kernels (436 - 582 GB/s!)
+// ============================================================================
+__device__ __forceinline__ __half2 soa_u32_to_h2(uint32_t x) { return *reinterpret_cast<const __half2*>(&x); }
+__device__ __forceinline__ __half2 soa_u8_lo_h2(uint32_t u) {
+    return __hsub2(soa_u32_to_h2(__byte_perm(u, 0x64006400u, 0x5150)), __float2half2_rn(1152.0f));
+}
+__device__ __forceinline__ __half2 soa_u8_hi_h2(uint32_t u) {
+    return __hsub2(soa_u32_to_h2(__byte_perm(u, 0x64006400u, 0x7372)), __float2half2_rn(1152.0f));
+}
+__device__ __forceinline__ __half2 soa_q6_lo_h2(uint32_t u6) {
+    return __hsub2(soa_u32_to_h2(__byte_perm(u6, 0x64006400u, 0x5150)), __float2half2_rn(1056.0f));
+}
+__device__ __forceinline__ __half2 soa_q6_hi_h2(uint32_t u6) {
+    return __hsub2(soa_u32_to_h2(__byte_perm(u6, 0x64006400u, 0x7372)), __float2half2_rn(1056.0f));
+}
+__device__ __forceinline__ __half2 soa_q81_pair_h2(const int8_t* qs2, __half2 c1152, __half2 inv128) {
+    const uint16_t pair = *reinterpret_cast<const uint16_t*>(qs2);
+    const uint32_t vx = ((uint32_t) pair) ^ 0x8080u;
+    const uint32_t h = __byte_perm(vx, 0x64006400u, 0x5150);
+    return __hmul2(__hsub2(soa_u32_to_h2(h), c1152), inv128);
+}
+
+template<int NT, int SK, int TILE_B = 16>
+__global__ void __launch_bounds__(128) p100_q80_soa_km_kernel(const uint8_t* __restrict__ weights,
+                                                              const Q81Block* __restrict__ x,
+                                                              float* __restrict__ y,
+                                                              int n_in, int n_out) {
+    const int K_blk = n_in >> 5;
+    const int kpart = (SK == 1) ? 0 : (int) blockIdx.y;
+    const int b_start = (SK == 1) ? 0 : ((K_blk * kpart) / SK);
+    const int b_end   = (SK == 1) ? K_blk : ((K_blk * (kpart + 1)) / SK);
+    const int tid = threadIdx.x;
+    const int r = (int) blockIdx.x * 128 + tid;
+
+    const uint4* Wq = reinterpret_cast<const uint4*>(weights);
+    const __half* Wd = reinterpret_cast<const __half*>(weights + (std::size_t) n_in * (std::size_t) n_out);
+
+    __shared__ __align__(16) __half2 sxh[NT][TILE_B * 16];
+    __shared__ float sxd[NT][TILE_B];
+    const __half2 c1152 = __float2half2_rn(1152.0f);
+    const __half2 inv128 = __float2half2_rn(1.0f / 128.0f);
+
+    float acc[NT];
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+
+    for (int b0 = b_start; b0 < b_end; b0 += TILE_B) {
+        const int nb = (b0 + TILE_B <= b_end) ? TILE_B : (b_end - b0);
+        for (int i = tid; i < nb * 8; i += 128) {
+            const int db = i >> 3;
+            const int j = i & 7;
+            const int b = b0 + db;
+#pragma unroll
+            for (int k = 0; k < NT; ++k) {
+                const Q81Block& bx = x[(std::size_t) k * K_blk + b];
+                const uint32_t q4 = __ldg(reinterpret_cast<const uint32_t*>(bx.qs) + j) ^ 0x80808080u;
+                sxh[k][i * 2 + 0] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x5150)), c1152), inv128);
+                sxh[k][i * 2 + 1] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x7372)), c1152), inv128);
+                if (j == 0) sxd[k][db] = __low2float(bx.ds) * 128.0f;
+            }
+        }
+        __syncthreads();
+        if (r < n_out) {
+            for (int db = 0; db < nb; ++db) {
+                const int b = b0 + db;
+                const float d = __half2float(__ldg(Wd + (std::size_t) b * n_out + r));
+                __half2 p[NT];
+#pragma unroll
+                for (int k = 0; k < NT; ++k) p[k] = __float2half2_rn(0.0f);
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const uint4 qv = __ldg(Wq + (std::size_t) (b * 2 + h) * n_out + r);
+                    const int xb = db * 16 + h * 8;
+                    const __half2 w0 = soa_u8_lo_h2(qv.x), w1 = soa_u8_hi_h2(qv.x);
+                    const __half2 w2 = soa_u8_lo_h2(qv.y), w3 = soa_u8_hi_h2(qv.y);
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&sxh[k][xb + 0]);
+                        __half2 pk = p[k];
+                        pk = __hfma2(w0, soa_u32_to_h2(xv.x), pk); pk = __hfma2(w1, soa_u32_to_h2(xv.y), pk);
+                        pk = __hfma2(w2, soa_u32_to_h2(xv.z), pk); pk = __hfma2(w3, soa_u32_to_h2(xv.w), pk);
+                        p[k] = pk;
+                    }
+                    const __half2 w4 = soa_u8_lo_h2(qv.z), w5 = soa_u8_hi_h2(qv.z);
+                    const __half2 w6 = soa_u8_lo_h2(qv.w), w7 = soa_u8_hi_h2(qv.w);
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&sxh[k][xb + 4]);
+                        __half2 pk = p[k];
+                        pk = __hfma2(w4, soa_u32_to_h2(xv.x), pk); pk = __hfma2(w5, soa_u32_to_h2(xv.y), pk);
+                        pk = __hfma2(w6, soa_u32_to_h2(xv.z), pk); pk = __hfma2(w7, soa_u32_to_h2(xv.w), pk);
+                        p[k] = pk;
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    const float2 f = __half22float2(p[k]);
+                    acc[k] = fmaf(d * sxd[k][db], f.x + f.y, acc[k]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            if constexpr (SK == 1) y[(std::size_t) k * n_out + r] = acc[k];
+            else atomicAdd(y + (std::size_t) k * n_out + r, acc[k]);
+        }
+    }
+}
+
+template<int NT, int SK>
+__global__ void __launch_bounds__(64) p100_q6k_soa_km_kernel(const uint8_t* __restrict__ weights,
+                                                             const Q81Block* __restrict__ x,
+                                                             float* __restrict__ y,
+                                                             int n_in, int n_out) {
+    const int K_blk = n_in >> 8; // n_in / 256
+    const int K_q8  = n_in >> 5; // n_in / 32 = K_blk * 8
+    const int kpart = (SK == 1) ? 0 : (int) blockIdx.y;
+    const int b_start = (SK == 1) ? 0 : ((K_blk * kpart) / SK);
+    const int b_end   = (SK == 1) ? K_blk : ((K_blk * (kpart + 1)) / SK);
+    const int tid = threadIdx.x;
+    const int r = (int) blockIdx.x * 64 + tid;
+
+    const uint4* Wql = reinterpret_cast<const uint4*>(weights);
+    const uint4* Wqh = Wql + (std::size_t) K_blk * 8 * n_out;
+    const uint4* Wsc = Wqh + (std::size_t) K_blk * 4 * n_out;
+    const __half* Wd = reinterpret_cast<const __half*>(Wsc + (std::size_t) K_blk * n_out);
+
+    __shared__ __half2 sxh[NT][128];
+    __shared__ float sxd[NT][8];
+    const __half2 c1152 = __float2half2_rn(1152.0f);
+    const __half2 inv128 = __float2half2_rn(1.0f / 128.0f);
+
+    float acc[NT];
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+
+    for (int b = b_start; b < b_end; ++b) {
+        {
+            const int qb = tid >> 3; // 0..7
+            const int j = tid & 7;
+#pragma unroll
+            for (int k = 0; k < NT; ++k) {
+                const Q81Block& bx = x[(std::size_t) k * K_q8 + b * 8 + qb];
+                const uint32_t q4 = __ldg(reinterpret_cast<const uint32_t*>(bx.qs) + j) ^ 0x80808080u;
+                sxh[k][tid * 2 + 0] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x5150)), c1152), inv128);
+                sxh[k][tid * 2 + 1] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x7372)), c1152), inv128);
+                if (j == 0) sxd[k][qb] = __low2float(bx.ds) * 128.0f;
+            }
+        }
+        __syncthreads();
+        if (r < n_out) {
+            const float d = __half2float(__ldg(Wd + (std::size_t) b * n_out + r));
+            const uint4 scv = __ldg(Wsc + (std::size_t) b * n_out + r);
+            const int8_t* sc = reinterpret_cast<const int8_t*>(&scv);
+            float ba[NT];
+#pragma unroll
+            for (int k = 0; k < NT; ++k) ba[k] = 0.0f;
+
+#pragma unroll
+            for (int hf = 0; hf < 2; ++hf) {
+#pragma unroll
+                for (int s = 0; s < 2; ++s) {
+                    const uint4 ql_a = __ldg(Wql + (std::size_t) (b * 8 + hf * 4 + s) * n_out + r);
+                    const uint4 ql_b = __ldg(Wql + (std::size_t) (b * 8 + hf * 4 + 2 + s) * n_out + r);
+                    const uint4 qhv  = __ldg(Wqh + (std::size_t) (b * 4 + hf * 2 + s) * n_out + r);
+                    const uint32_t a4[4] = {ql_a.x, ql_a.y, ql_a.z, ql_a.w};
+                    const uint32_t b4[4] = {ql_b.x, ql_b.y, ql_b.z, ql_b.w};
+                    const uint32_t h4[4] = {qhv.x,  qhv.y,  qhv.z,  qhv.w};
+                    const int sc_base = hf * 8 + s;
+                    const float s1 = float(sc[sc_base + 0]);
+                    const float s2 = float(sc[sc_base + 2]);
+                    const float s3 = float(sc[sc_base + 4]);
+                    const float s4 = float(sc[sc_base + 6]);
+                    __half2 p1[NT], p2[NT], p3[NT], p4[NT];
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        p1[k] = __float2half2_rn(0.0f); p2[k] = __float2half2_rn(0.0f);
+                        p3[k] = __float2half2_rn(0.0f); p4[k] = __float2half2_rn(0.0f);
+                    }
+                    const int xb = hf * 64 + s * 8;
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const uint32_t la = a4[u], lb = b4[u], hv = h4[u];
+                        const uint32_t q1 = (la & 0x0f0f0f0fu)        | ((hv & 0x03030303u) << 4);
+                        const uint32_t q2 = (lb & 0x0f0f0f0fu)        | ((hv & 0x0c0c0c0cu) << 2);
+                        const uint32_t q3 = ((la >> 4) & 0x0f0f0f0fu) | (hv & 0x30303030u);
+                        const uint32_t q4 = ((lb >> 4) & 0x0f0f0f0fu) | ((hv >> 2) & 0x30303030u);
+                        const __half2 w1a = soa_q6_lo_h2(q1), w1b = soa_q6_hi_h2(q1);
+                        const __half2 w2a = soa_q6_lo_h2(q2), w2b = soa_q6_hi_h2(q2);
+                        const __half2 w3a = soa_q6_lo_h2(q3), w3b = soa_q6_hi_h2(q3);
+                        const __half2 w4a = soa_q6_lo_h2(q4), w4b = soa_q6_hi_h2(q4);
+                        const int xo = xb + u * 2;
+#pragma unroll
+                        for (int k = 0; k < NT; ++k) {
+                            p1[k] = __hfma2(w1a, sxh[k][xo +  0], p1[k]); p1[k] = __hfma2(w1b, sxh[k][xo +  1], p1[k]);
+                            p2[k] = __hfma2(w2a, sxh[k][xo + 16], p2[k]); p2[k] = __hfma2(w2b, sxh[k][xo + 17], p2[k]);
+                            p3[k] = __hfma2(w3a, sxh[k][xo + 32], p3[k]); p3[k] = __hfma2(w3b, sxh[k][xo + 33], p3[k]);
+                            p4[k] = __hfma2(w4a, sxh[k][xo + 48], p4[k]); p4[k] = __hfma2(w4b, sxh[k][xo + 49], p4[k]);
+                        }
+                    }
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const float2 f1 = __half22float2(p1[k]);
+                        const float2 f2 = __half22float2(p2[k]);
+                        const float2 f3 = __half22float2(p3[k]);
+                        const float2 f4 = __half22float2(p4[k]);
+                        float v = ba[k];
+                        v = fmaf(s1 * sxd[k][hf * 4 + 0], f1.x + f1.y, v);
+                        v = fmaf(s2 * sxd[k][hf * 4 + 1], f2.x + f2.y, v);
+                        v = fmaf(s3 * sxd[k][hf * 4 + 2], f3.x + f3.y, v);
+                        v = fmaf(s4 * sxd[k][hf * 4 + 3], f4.x + f4.y, v);
+                        ba[k] = v;
+                    }
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < NT; ++k) acc[k] = fmaf(d, ba[k], acc[k]);
+        }
+        __syncthreads();
+    }
+    if (r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            if constexpr (SK == 1) y[(std::size_t) k * n_out + r] = acc[k];
+            else atomicAdd(y + (std::size_t) k * n_out + r, acc[k]);
+        }
+    }
+}
+
+// Block-internal Split-K Q8_0 K-Major SoA: 32 rows/block, NW warps split K inside block ->
+// ZERO cudaMemsetAsync, ZERO atomicAdd, 100% deterministic, 100% coalesced LDG.E.128!
+// TILE_B=80 preloads all K_blk<=80 in 1 pass (zero mid-loop __syncthreads); TILE_B=32 tiles larger K.
+template<int NT, int NW, int TILE_B>
+__global__ void __launch_bounds__(NW * 32) p100_q80_soa_bsk_kernel(const uint8_t* __restrict__ weights,
+                                                                   const Q81Block* __restrict__ x,
+                                                                   float* __restrict__ y,
+                                                                   int n_in, int n_out) {
+    const int K_blk = n_in >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int r = (int) blockIdx.x * 32 + lane;
+    const uint4* Wq = reinterpret_cast<const uint4*>(weights);
+    const __half* Wd = reinterpret_cast<const __half*>(weights + (std::size_t) n_in * (std::size_t) n_out);
+
+    union BskSmem {
+        struct {
+            __align__(16) __half2 sxh[NT][TILE_B * 16];
+            float sxd[NT][TILE_B];
+        } x;
+        float part[NW][NT][32];
+    };
+    __shared__ BskSmem smem;
+    const __half2 c1152 = __float2half2_rn(1152.0f);
+    const __half2 inv128 = __float2half2_rn(1.0f / 128.0f);
+
+    float acc[NT];
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+
+    for (int b0 = 0; b0 < K_blk; b0 += TILE_B) {
+        const int nb = (b0 + TILE_B <= K_blk) ? TILE_B : (K_blk - b0);
+        for (int i = tid; i < nb * 8; i += NW * 32) {
+            const int db = i >> 3, j = i & 7;
+            const int b = b0 + db;
+#pragma unroll
+            for (int k = 0; k < NT; ++k) {
+                const Q81Block& bx = x[(std::size_t) k * K_blk + b];
+                const uint32_t q4 = __ldg(reinterpret_cast<const uint32_t*>(bx.qs) + j) ^ 0x80808080u;
+                smem.x.sxh[k][i * 2 + 0] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x5150)), c1152), inv128);
+                smem.x.sxh[k][i * 2 + 1] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x7372)), c1152), inv128);
+                if (j == 0) smem.x.sxd[k][db] = __low2float(bx.ds) * 128.0f;
+            }
+        }
+        __syncthreads();
+        if (r < n_out) {
+            for (int db = warp; db < nb; db += NW) {
+                const int b = b0 + db;
+                const float d = __half2float(__ldg(Wd + (std::size_t) b * n_out + r));
+                __half2 p[NT];
+#pragma unroll
+                for (int k = 0; k < NT; ++k) p[k] = __float2half2_rn(0.0f);
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const uint4 qv = __ldg(Wq + (std::size_t) (b * 2 + h) * n_out + r);
+                    const int xb = db * 16 + h * 8;
+                    const __half2 w0 = soa_u8_lo_h2(qv.x), w1 = soa_u8_hi_h2(qv.x);
+                    const __half2 w2 = soa_u8_lo_h2(qv.y), w3 = soa_u8_hi_h2(qv.y);
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&smem.x.sxh[k][xb + 0]);
+                        __half2 pk = p[k];
+                        pk = __hfma2(w0, soa_u32_to_h2(xv.x), pk); pk = __hfma2(w1, soa_u32_to_h2(xv.y), pk);
+                        pk = __hfma2(w2, soa_u32_to_h2(xv.z), pk); pk = __hfma2(w3, soa_u32_to_h2(xv.w), pk);
+                        p[k] = pk;
+                    }
+                    const __half2 w4 = soa_u8_lo_h2(qv.z), w5 = soa_u8_hi_h2(qv.z);
+                    const __half2 w6 = soa_u8_lo_h2(qv.w), w7 = soa_u8_hi_h2(qv.w);
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&smem.x.sxh[k][xb + 4]);
+                        __half2 pk = p[k];
+                        pk = __hfma2(w4, soa_u32_to_h2(xv.x), pk); pk = __hfma2(w5, soa_u32_to_h2(xv.y), pk);
+                        pk = __hfma2(w6, soa_u32_to_h2(xv.z), pk); pk = __hfma2(w7, soa_u32_to_h2(xv.w), pk);
+                        p[k] = pk;
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    const float2 f = __half22float2(p[k]);
+                    acc[k] = fmaf(d * smem.x.sxd[k][db], f.x + f.y, acc[k]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) smem.part[warp][k][lane] = acc[k];
+    }
+    __syncthreads();
+    if (warp == 0 && r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            float s = smem.part[0][k][lane];
+#pragma unroll
+            for (int w = 1; w < NW; ++w) s += smem.part[w][k][lane];
+            y[(std::size_t) k * n_out + r] = s;
+        }
+    }
+}
+
+// 16 rows/block K-Major SoA Q8_0 (2*NW half-warps split K, 16*16B=256B 100% coalesced LDG.E.128):
+// doubles SM utilization on skinny/medium n_out (k_proj/v_proj 512, ssm_out/o_proj/fc 2560)!
+template<int NT, int NW, int TILE_B>
+__global__ void __launch_bounds__(NW * 32) p100_q80_soa_bsk16_kernel(const uint8_t* __restrict__ weights,
+                                                                     const Q81Block* __restrict__ x,
+                                                                     float* __restrict__ y,
+                                                                     int n_in, int n_out) {
+    constexpr int NHW = NW * 2;
+    const int K_blk = n_in >> 5;
+    const int tid = threadIdx.x, hl = tid & 15, hw = tid >> 4;
+    const int r = (int) blockIdx.x * 16 + hl;
+    const uint4* Wq = reinterpret_cast<const uint4*>(weights);
+    const __half* Wd = reinterpret_cast<const __half*>(weights + (std::size_t) n_in * (std::size_t) n_out);
+
+    union Bsk16Smem {
+        struct {
+            __align__(16) __half2 sxh[NT][TILE_B * 16];
+            float sxd[NT][TILE_B];
+        } x;
+        float part[NHW][NT][16];
+    };
+    __shared__ Bsk16Smem smem;
+    const __half2 c1152 = __float2half2_rn(1152.0f);
+    const __half2 inv128 = __float2half2_rn(1.0f / 128.0f);
+
+    float acc[NT];
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+
+    for (int b0 = 0; b0 < K_blk; b0 += TILE_B) {
+        const int nb = (b0 + TILE_B <= K_blk) ? TILE_B : (K_blk - b0);
+        for (int i = tid; i < nb * 8; i += NW * 32) {
+            const int db = i >> 3, j = i & 7;
+            const int b = b0 + db;
+#pragma unroll
+            for (int k = 0; k < NT; ++k) {
+                const Q81Block& bx = x[(std::size_t) k * K_blk + b];
+                const uint32_t q4 = __ldg(reinterpret_cast<const uint32_t*>(bx.qs) + j) ^ 0x80808080u;
+                smem.x.sxh[k][i * 2 + 0] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x5150)), c1152), inv128);
+                smem.x.sxh[k][i * 2 + 1] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x7372)), c1152), inv128);
+                if (j == 0) smem.x.sxd[k][db] = __low2float(bx.ds) * 128.0f;
+            }
+        }
+        __syncthreads();
+        if (r < n_out) {
+            for (int db = hw; db < nb; db += NHW) {
+                const int b = b0 + db;
+                const float d = __half2float(__ldg(Wd + (std::size_t) b * n_out + r));
+                __half2 p[NT];
+#pragma unroll
+                for (int k = 0; k < NT; ++k) p[k] = __float2half2_rn(0.0f);
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const uint4 qv = __ldg(Wq + (std::size_t) (b * 2 + h) * n_out + r);
+                    const int xb = db * 16 + h * 8;
+                    const __half2 w0 = soa_u8_lo_h2(qv.x), w1 = soa_u8_hi_h2(qv.x);
+                    const __half2 w2 = soa_u8_lo_h2(qv.y), w3 = soa_u8_hi_h2(qv.y);
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&smem.x.sxh[k][xb + 0]);
+                        __half2 pk = p[k];
+                        pk = __hfma2(w0, soa_u32_to_h2(xv.x), pk); pk = __hfma2(w1, soa_u32_to_h2(xv.y), pk);
+                        pk = __hfma2(w2, soa_u32_to_h2(xv.z), pk); pk = __hfma2(w3, soa_u32_to_h2(xv.w), pk);
+                        p[k] = pk;
+                    }
+                    const __half2 w4 = soa_u8_lo_h2(qv.z), w5 = soa_u8_hi_h2(qv.z);
+                    const __half2 w6 = soa_u8_lo_h2(qv.w), w7 = soa_u8_hi_h2(qv.w);
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&smem.x.sxh[k][xb + 4]);
+                        __half2 pk = p[k];
+                        pk = __hfma2(w4, soa_u32_to_h2(xv.x), pk); pk = __hfma2(w5, soa_u32_to_h2(xv.y), pk);
+                        pk = __hfma2(w6, soa_u32_to_h2(xv.z), pk); pk = __hfma2(w7, soa_u32_to_h2(xv.w), pk);
+                        p[k] = pk;
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    const float2 f = __half22float2(p[k]);
+                    acc[k] = fmaf(d * smem.x.sxd[k][db], f.x + f.y, acc[k]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) smem.part[hw][k][hl] = acc[k];
+    }
+    __syncthreads();
+    if (hw == 0 && r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            float s = smem.part[0][k][hl];
+#pragma unroll
+            for (int w = 1; w < NHW; ++w) s += smem.part[w][k][hl];
+            y[(std::size_t) k * n_out + r] = s;
+        }
+    }
+}
+
+// Block-internal Split-K Q6_K K-Major SoA: 32 rows/block, NW warps each own a distinct Q6_K block ->
+// ZERO cudaMemsetAsync, ZERO atomicAdd, ZERO block-sync in inner loop!
+template<int NT, int NW>
+__global__ void __launch_bounds__(NW * 32) p100_q6k_soa_bsk_kernel(const uint8_t* __restrict__ weights,
+                                                                   const Q81Block* __restrict__ x,
+                                                                   float* __restrict__ y,
+                                                                   int n_in, int n_out) {
+    const int K_blk = n_in >> 8;
+    const int K_q8  = n_in >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int r = (int) blockIdx.x * 32 + lane;
+    const uint4* Wql = reinterpret_cast<const uint4*>(weights);
+    const uint4* Wqh = Wql + (std::size_t) K_blk * 8 * n_out;
+    const uint4* Wsc = Wqh + (std::size_t) K_blk * 4 * n_out;
+    const __half* Wd = reinterpret_cast<const __half*>(Wsc + (std::size_t) K_blk * n_out);
+
+    __shared__ __half2 sxh[NW][NT][128];
+    __shared__ float sxd[NW][NT][8];
+    __shared__ float part[NW][NT][32];
+    const __half2 c1152 = __float2half2_rn(1152.0f);
+    const __half2 inv128 = __float2half2_rn(1.0f / 128.0f);
+
+    float acc[NT];
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+
+    for (int b0 = 0; b0 < K_blk; b0 += NW) {
+        const int nb = (b0 + NW <= K_blk) ? NW : (K_blk - b0);
+        if (warp < nb) {
+            const int b = b0 + warp;
+#pragma unroll
+            for (int it = 0; it < 4; ++it) {
+                const int i = it * 32 + lane;
+                const int qb = i >> 4, j = i & 15;
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    const Q81Block& bx = x[(std::size_t) k * K_q8 + b * 8 + qb];
+                    sxh[warp][k][i] = soa_q81_pair_h2(bx.qs + 2 * j, c1152, inv128);
+                    if (j == 0) sxd[warp][k][qb] = __low2float(bx.ds) * 128.0f;
+                }
+            }
+            __syncwarp();
+            if (r < n_out) {
+                const float d = __half2float(__ldg(Wd + (std::size_t) b * n_out + r));
+                const uint4 scv = __ldg(Wsc + (std::size_t) b * n_out + r);
+                const int8_t* sc = reinterpret_cast<const int8_t*>(&scv);
+                float ba[NT];
+#pragma unroll
+                for (int k = 0; k < NT; ++k) ba[k] = 0.0f;
+#pragma unroll
+                for (int hf = 0; hf < 2; ++hf) {
+#pragma unroll
+                    for (int s = 0; s < 2; ++s) {
+                        const uint4 ql_a = __ldg(Wql + (std::size_t) (b * 8 + hf * 4 + s) * n_out + r);
+                        const uint4 ql_b = __ldg(Wql + (std::size_t) (b * 8 + hf * 4 + 2 + s) * n_out + r);
+                        const uint4 qhv  = __ldg(Wqh + (std::size_t) (b * 4 + hf * 2 + s) * n_out + r);
+                        const uint32_t a4[4] = {ql_a.x, ql_a.y, ql_a.z, ql_a.w};
+                        const uint32_t b4[4] = {ql_b.x, ql_b.y, ql_b.z, ql_b.w};
+                        const uint32_t h4[4] = {qhv.x,  qhv.y,  qhv.z,  qhv.w};
+                        const int sc_base = hf * 8 + s;
+                        const float s1 = float(sc[sc_base + 0]), s2 = float(sc[sc_base + 2]);
+                        const float s3 = float(sc[sc_base + 4]), s4 = float(sc[sc_base + 6]);
+                        __half2 p1[NT], p2[NT], p3[NT], p4[NT];
+#pragma unroll
+                        for (int k = 0; k < NT; ++k) {
+                            p1[k] = __float2half2_rn(0.0f); p2[k] = __float2half2_rn(0.0f);
+                            p3[k] = __float2half2_rn(0.0f); p4[k] = __float2half2_rn(0.0f);
+                        }
+                        const int xb = hf * 64 + s * 8;
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const uint32_t la = a4[u], lb = b4[u], hv = h4[u];
+                            const uint32_t q1 = (la & 0x0f0f0f0fu)        | ((hv & 0x03030303u) << 4);
+                            const uint32_t q2 = (lb & 0x0f0f0f0fu)        | ((hv & 0x0c0c0c0cu) << 2);
+                            const uint32_t q3 = ((la >> 4) & 0x0f0f0f0fu) | (hv & 0x30303030u);
+                            const uint32_t q4 = ((lb >> 4) & 0x0f0f0f0fu) | ((hv >> 2) & 0x30303030u);
+                            const __half2 w1a = soa_q6_lo_h2(q1), w1b = soa_q6_hi_h2(q1);
+                            const __half2 w2a = soa_q6_lo_h2(q2), w2b = soa_q6_hi_h2(q2);
+                            const __half2 w3a = soa_q6_lo_h2(q3), w3b = soa_q6_hi_h2(q3);
+                            const __half2 w4a = soa_q6_lo_h2(q4), w4b = soa_q6_hi_h2(q4);
+                            const int xo = xb + u * 2;
+#pragma unroll
+                            for (int k = 0; k < NT; ++k) {
+                                p1[k] = __hfma2(w1a, sxh[warp][k][xo +  0], p1[k]); p1[k] = __hfma2(w1b, sxh[warp][k][xo +  1], p1[k]);
+                                p2[k] = __hfma2(w2a, sxh[warp][k][xo + 16], p2[k]); p2[k] = __hfma2(w2b, sxh[warp][k][xo + 17], p2[k]);
+                                p3[k] = __hfma2(w3a, sxh[warp][k][xo + 32], p3[k]); p3[k] = __hfma2(w3b, sxh[warp][k][xo + 33], p3[k]);
+                                p4[k] = __hfma2(w4a, sxh[warp][k][xo + 48], p4[k]); p4[k] = __hfma2(w4b, sxh[warp][k][xo + 49], p4[k]);
+                            }
+                        }
+#pragma unroll
+                        for (int k = 0; k < NT; ++k) {
+                            const float2 f1 = __half22float2(p1[k]), f2 = __half22float2(p2[k]);
+                            const float2 f3 = __half22float2(p3[k]), f4 = __half22float2(p4[k]);
+                            float v = ba[k];
+                            v = fmaf(s1 * sxd[warp][k][hf * 4 + 0], f1.x + f1.y, v);
+                            v = fmaf(s2 * sxd[warp][k][hf * 4 + 1], f2.x + f2.y, v);
+                            v = fmaf(s3 * sxd[warp][k][hf * 4 + 2], f3.x + f3.y, v);
+                            v = fmaf(s4 * sxd[warp][k][hf * 4 + 3], f4.x + f4.y, v);
+                            ba[k] = v;
+                        }
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < NT; ++k) acc[k] = fmaf(d, ba[k], acc[k]);
+            }
+        }
+    }
+    if (r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) part[warp][k][lane] = acc[k];
+    }
+    __syncthreads();
+    if (warp == 0 && r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            float s = part[0][k][lane];
+#pragma unroll
+            for (int w = 1; w < NW; ++w) s += part[w][k][lane];
+            y[(std::size_t) k * n_out + r] = s;
+        }
+    }
+}
+
+// Dual-output Q8_0 SoA BSK kernels: fuse two matrices sharing the same input x (e.g. GDN qkv+z, QSA k+v)
+// into a single launch to fill all 56 GP100 SMs and eliminate tail waves + kernel launch overhead!
+template<int NT, int NW, int TILE_B>
+__global__ void __launch_bounds__(NW * 32) p100_q80_soa_bsk_dual_kernel(
+    const uint8_t* __restrict__ wA, const uint8_t* __restrict__ wB,
+    const Q81Block* __restrict__ x, float* __restrict__ yA, float* __restrict__ yB,
+    int n_in, int n_out_A, int n_out_B, int gxA) {
+    const bool is_b = (int) blockIdx.x >= gxA;
+    const uint8_t* weights = is_b ? wB : wA;
+    float* y = is_b ? yB : yA;
+    const int n_out = is_b ? n_out_B : n_out_A;
+    const int bx_local = is_b ? ((int) blockIdx.x - gxA) : (int) blockIdx.x;
+    const int K_blk = n_in >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int r = bx_local * 32 + lane;
+    const uint4* Wq = reinterpret_cast<const uint4*>(weights);
+    const __half* Wd = reinterpret_cast<const __half*>(weights + (std::size_t) n_in * (std::size_t) n_out);
+
+    union BskDualSmem {
+        struct {
+            __align__(16) __half2 sxh[NT][TILE_B * 16];
+            float sxd[NT][TILE_B];
+        } x;
+        float part[NW][NT][32];
+    };
+    __shared__ BskDualSmem smem;
+    const __half2 c1152 = __float2half2_rn(1152.0f);
+    const __half2 inv128 = __float2half2_rn(1.0f / 128.0f);
+
+    float acc[NT];
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+
+    for (int b0 = 0; b0 < K_blk; b0 += TILE_B) {
+        const int nb = (b0 + TILE_B <= K_blk) ? TILE_B : (K_blk - b0);
+        for (int i = tid; i < nb * 8; i += NW * 32) {
+            const int db = i >> 3, j = i & 7;
+            const int b = b0 + db;
+#pragma unroll
+            for (int k = 0; k < NT; ++k) {
+                const Q81Block& bx = x[(std::size_t) k * K_blk + b];
+                const uint32_t q4 = __ldg(reinterpret_cast<const uint32_t*>(bx.qs) + j) ^ 0x80808080u;
+                smem.x.sxh[k][i * 2 + 0] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x5150)), c1152), inv128);
+                smem.x.sxh[k][i * 2 + 1] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x7372)), c1152), inv128);
+                if (j == 0) smem.x.sxd[k][db] = __low2float(bx.ds) * 128.0f;
+            }
+        }
+        __syncthreads();
+        if (r < n_out) {
+            for (int db = warp; db < nb; db += NW) {
+                const int b = b0 + db;
+                const float d = __half2float(__ldg(Wd + (std::size_t) b * n_out + r));
+                __half2 p[NT];
+#pragma unroll
+                for (int k = 0; k < NT; ++k) p[k] = __float2half2_rn(0.0f);
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const uint4 qv = __ldg(Wq + (std::size_t) (b * 2 + h) * n_out + r);
+                    const int xb = db * 16 + h * 8;
+                    const __half2 w0 = soa_u8_lo_h2(qv.x), w1 = soa_u8_hi_h2(qv.x);
+                    const __half2 w2 = soa_u8_lo_h2(qv.y), w3 = soa_u8_hi_h2(qv.y);
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&smem.x.sxh[k][xb + 0]);
+                        __half2 pk = p[k];
+                        pk = __hfma2(w0, soa_u32_to_h2(xv.x), pk); pk = __hfma2(w1, soa_u32_to_h2(xv.y), pk);
+                        pk = __hfma2(w2, soa_u32_to_h2(xv.z), pk); pk = __hfma2(w3, soa_u32_to_h2(xv.w), pk);
+                        p[k] = pk;
+                    }
+                    const __half2 w4 = soa_u8_lo_h2(qv.z), w5 = soa_u8_hi_h2(qv.z);
+                    const __half2 w6 = soa_u8_lo_h2(qv.w), w7 = soa_u8_hi_h2(qv.w);
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&smem.x.sxh[k][xb + 4]);
+                        __half2 pk = p[k];
+                        pk = __hfma2(w4, soa_u32_to_h2(xv.x), pk); pk = __hfma2(w5, soa_u32_to_h2(xv.y), pk);
+                        pk = __hfma2(w6, soa_u32_to_h2(xv.z), pk); pk = __hfma2(w7, soa_u32_to_h2(xv.w), pk);
+                        p[k] = pk;
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    const float2 f = __half22float2(p[k]);
+                    acc[k] = fmaf(d * smem.x.sxd[k][db], f.x + f.y, acc[k]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) smem.part[warp][k][lane] = acc[k];
+    }
+    __syncthreads();
+    if (warp == 0 && r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            float s = smem.part[0][k][lane];
+#pragma unroll
+            for (int w = 1; w < NW; ++w) s += smem.part[w][k][lane];
+            y[(std::size_t) k * n_out + r] = s;
+        }
+    }
+}
+
+template<int NT, int NW, int TILE_B>
+__global__ void __launch_bounds__(NW * 32) p100_q80_soa_bsk16_dual_kernel(
+    const uint8_t* __restrict__ wA, const uint8_t* __restrict__ wB,
+    const Q81Block* __restrict__ x, float* __restrict__ yA, float* __restrict__ yB,
+    int n_in, int n_out_A, int n_out_B, int gxA) {
+    constexpr int NHW = NW * 2;
+    const bool is_b = (int) blockIdx.x >= gxA;
+    const uint8_t* weights = is_b ? wB : wA;
+    float* y = is_b ? yB : yA;
+    const int n_out = is_b ? n_out_B : n_out_A;
+    const int bx_local = is_b ? ((int) blockIdx.x - gxA) : (int) blockIdx.x;
+    const int K_blk = n_in >> 5;
+    const int tid = threadIdx.x, hl = tid & 15, hw = tid >> 4;
+    const int r = bx_local * 16 + hl;
+    const uint4* Wq = reinterpret_cast<const uint4*>(weights);
+    const __half* Wd = reinterpret_cast<const __half*>(weights + (std::size_t) n_in * (std::size_t) n_out);
+
+    union Bsk16DualSmem {
+        struct {
+            __align__(16) __half2 sxh[NT][TILE_B * 16];
+            float sxd[NT][TILE_B];
+        } x;
+        float part[NHW][NT][16];
+    };
+    __shared__ Bsk16DualSmem smem;
+    const __half2 c1152 = __float2half2_rn(1152.0f);
+    const __half2 inv128 = __float2half2_rn(1.0f / 128.0f);
+
+    float acc[NT];
+#pragma unroll
+    for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
+
+    for (int b0 = 0; b0 < K_blk; b0 += TILE_B) {
+        const int nb = (b0 + TILE_B <= K_blk) ? TILE_B : (K_blk - b0);
+        for (int i = tid; i < nb * 8; i += NW * 32) {
+            const int db = i >> 3, j = i & 7;
+            const int b = b0 + db;
+#pragma unroll
+            for (int k = 0; k < NT; ++k) {
+                const Q81Block& bx = x[(std::size_t) k * K_blk + b];
+                const uint32_t q4 = __ldg(reinterpret_cast<const uint32_t*>(bx.qs) + j) ^ 0x80808080u;
+                smem.x.sxh[k][i * 2 + 0] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x5150)), c1152), inv128);
+                smem.x.sxh[k][i * 2 + 1] = __hmul2(__hsub2(soa_u32_to_h2(__byte_perm(q4, 0x64006400u, 0x7372)), c1152), inv128);
+                if (j == 0) smem.x.sxd[k][db] = __low2float(bx.ds) * 128.0f;
+            }
+        }
+        __syncthreads();
+        if (r < n_out) {
+            for (int db = hw; db < nb; db += NHW) {
+                const int b = b0 + db;
+                const float d = __half2float(__ldg(Wd + (std::size_t) b * n_out + r));
+                __half2 p[NT];
+#pragma unroll
+                for (int k = 0; k < NT; ++k) p[k] = __float2half2_rn(0.0f);
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const uint4 qv = __ldg(Wq + (std::size_t) (b * 2 + h) * n_out + r);
+                    const int xb = db * 16 + h * 8;
+                    const __half2 w0 = soa_u8_lo_h2(qv.x), w1 = soa_u8_hi_h2(qv.x);
+                    const __half2 w2 = soa_u8_lo_h2(qv.y), w3 = soa_u8_hi_h2(qv.y);
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&smem.x.sxh[k][xb + 0]);
+                        __half2 pk = p[k];
+                        pk = __hfma2(w0, soa_u32_to_h2(xv.x), pk); pk = __hfma2(w1, soa_u32_to_h2(xv.y), pk);
+                        pk = __hfma2(w2, soa_u32_to_h2(xv.z), pk); pk = __hfma2(w3, soa_u32_to_h2(xv.w), pk);
+                        p[k] = pk;
+                    }
+                    const __half2 w4 = soa_u8_lo_h2(qv.z), w5 = soa_u8_hi_h2(qv.z);
+                    const __half2 w6 = soa_u8_lo_h2(qv.w), w7 = soa_u8_hi_h2(qv.w);
+#pragma unroll
+                    for (int k = 0; k < NT; ++k) {
+                        const uint4 xv = *reinterpret_cast<const uint4*>(&smem.x.sxh[k][xb + 4]);
+                        __half2 pk = p[k];
+                        pk = __hfma2(w4, soa_u32_to_h2(xv.x), pk); pk = __hfma2(w5, soa_u32_to_h2(xv.y), pk);
+                        pk = __hfma2(w6, soa_u32_to_h2(xv.z), pk); pk = __hfma2(w7, soa_u32_to_h2(xv.w), pk);
+                        p[k] = pk;
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    const float2 f = __half22float2(p[k]);
+                    acc[k] = fmaf(d * smem.x.sxd[k][db], f.x + f.y, acc[k]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) smem.part[hw][k][hl] = acc[k];
+    }
+    __syncthreads();
+    if (hw == 0 && r < n_out) {
+#pragma unroll
+        for (int k = 0; k < NT; ++k) {
+            float s = smem.part[0][k][hl];
+#pragma unroll
+            for (int w = 1; w < NHW; ++w) s += smem.part[w][k][hl];
+            y[(std::size_t) k * n_out + r] = s;
+        }
+    }
+}
+
+template<int NT>
+void launch_q80_soa_km_nt(const uint8_t* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    const int K_blk = n_in >> 5;
+    if (n_out >= 16384) {
+        const unsigned gx = unsigned((n_out + 127) / 128);
+        if constexpr (NT >= 2 && NT <= 5) {
+            if ((K_blk % 40) == 0) {
+                p100_q80_soa_km_kernel<NT, 1, 40><<<dim3(gx, 1), 128, 0, s>>>(w, x, y, n_in, n_out);
+                return;
+            }
+        }
+        p100_q80_soa_km_kernel<NT, 1, 16><<<dim3(gx, 1), 128, 0, s>>>(w, x, y, n_in, n_out);
+        return;
+    }
+    if (n_out <= 2560 && (n_out & 15) == 0) {
+        const unsigned gx16 = unsigned(n_out >> 4);
+        if ((K_blk & 31) == 0) {
+            p100_q80_soa_bsk16_kernel<NT, 8, 32><<<gx16, 256, 0, s>>>(w, x, y, n_in, n_out);
+            return;
+        }
+        if ((K_blk & 15) == 0) {
+            p100_q80_soa_bsk16_kernel<NT, 8, 16><<<gx16, 256, 0, s>>>(w, x, y, n_in, n_out);
+            return;
+        }
+        p100_q80_soa_bsk16_kernel<NT, 4, 16><<<gx16, 128, 0, s>>>(w, x, y, n_in, n_out);
+        return;
+    }
+    const unsigned gx = unsigned((n_out + 31) / 32);
+    const bool tile40 = (NT <= 7) && ((K_blk % 40) == 0);
+    if constexpr (NT <= 7) {
+        if (tile40) { p100_q80_soa_bsk_kernel<NT, 8, 40><<<gx, 256, 0, s>>>(w, x, y, n_in, n_out); return; }
+    }
+    p100_q80_soa_bsk_kernel<NT, 8, 32><<<gx, 256, 0, s>>>(w, x, y, n_in, n_out);
+}
+
+template<int NT>
+void launch_q80_soa_dual_nt(const uint8_t* wA, const uint8_t* wB, const Q81Block* x,
+                            float* yA, float* yB, int n_in, int n_out_A, int n_out_B, cudaStream_t s) {
+    const int K_blk = n_in >> 5;
+    if (n_out_A <= 2560 && n_out_B <= 2560 && (n_out_A & 15) == 0 && (n_out_B & 15) == 0) {
+        const int gxA = n_out_A >> 4, gxB = n_out_B >> 4;
+        if ((K_blk & 31) == 0) {
+            p100_q80_soa_bsk16_dual_kernel<NT, 8, 32><<<unsigned(gxA + gxB), 256, 0, s>>>(
+                wA, wB, x, yA, yB, n_in, n_out_A, n_out_B, gxA);
+            return;
+        }
+        if ((K_blk & 15) == 0) {
+            p100_q80_soa_bsk16_dual_kernel<NT, 8, 16><<<unsigned(gxA + gxB), 256, 0, s>>>(
+                wA, wB, x, yA, yB, n_in, n_out_A, n_out_B, gxA);
+            return;
+        }
+        p100_q80_soa_bsk16_dual_kernel<NT, 4, 16><<<unsigned(gxA + gxB), 128, 0, s>>>(
+            wA, wB, x, yA, yB, n_in, n_out_A, n_out_B, gxA);
+    } else {
+        const int gxA = (n_out_A + 31) / 32, gxB = (n_out_B + 31) / 32;
+        const bool tile40 = (NT <= 7) && ((K_blk % 40) == 0);
+        if constexpr (NT <= 7) {
+            if (tile40) {
+                p100_q80_soa_bsk_dual_kernel<NT, 8, 40><<<unsigned(gxA + gxB), 256, 0, s>>>(
+                    wA, wB, x, yA, yB, n_in, n_out_A, n_out_B, gxA);
+                return;
+            }
+        }
+        p100_q80_soa_bsk_dual_kernel<NT, 8, 32><<<unsigned(gxA + gxB), 256, 0, s>>>(
+            wA, wB, x, yA, yB, n_in, n_out_A, n_out_B, gxA);
+    }
+}
+
+template<int NT>
+void launch_q6k_soa_km_nt(const uint8_t* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    const int K_blk = n_in >> 8;
+    if (n_out >= 16384) {
+        if constexpr (NT == 1) {
+            if (K_blk >= 5) {
+                const unsigned gx32 = unsigned((n_out + 31) / 32);
+                p100_q6k_soa_bsk_kernel<1, 5><<<gx32, 160, 0, s>>>(w, x, y, n_in, n_out);
+                return;
+            }
+        }
+        const unsigned gx = unsigned((n_out + 63) / 64);
+        p100_q6k_soa_km_kernel<NT, 1><<<dim3(gx, 1), 64, 0, s>>>(w, x, y, n_in, n_out);
+        return;
+    }
+    const unsigned gx = unsigned((n_out + 31) / 32);
+    if (K_blk >= 5) {
+        p100_q6k_soa_bsk_kernel<NT, 5><<<gx, 160, 0, s>>>(w, x, y, n_in, n_out);
+    } else {
+        p100_q6k_soa_bsk_kernel<NT, 4><<<gx, 128, 0, s>>>(w, x, y, n_in, n_out);
+    }
+}
+
+void native_q8_0_soa_mmvq(const void* weights, const void* x_q8_1, float* y,
+                          int n_in, int n_out, int ncols, void* stream) {
+    validate_shape(n_in, ncols, 32);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights); validate_pointer(x_q8_1); validate_pointer(y); validate_stream(stream);
+    const auto* w = static_cast<const uint8_t*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const int K_blk = n_in >> 5;
+    for (int c0 = 0; c0 < ncols; ) {
+        const int rem = ncols - c0;
+        const int nt = rem >= 8 ? 8 : rem;
+        const Q81Block* xc = x + (std::size_t) c0 * K_blk;
+        float* yc = y + (std::size_t) c0 * n_out;
+        switch (nt) {
+            case 1: launch_q80_soa_km_nt<1>(w, xc, yc, n_in, n_out, s); break;
+            case 2: launch_q80_soa_km_nt<2>(w, xc, yc, n_in, n_out, s); break;
+            case 3: launch_q80_soa_km_nt<3>(w, xc, yc, n_in, n_out, s); break;
+            case 4: launch_q80_soa_km_nt<4>(w, xc, yc, n_in, n_out, s); break;
+            case 5: launch_q80_soa_km_nt<5>(w, xc, yc, n_in, n_out, s); break;
+            case 6: launch_q80_soa_km_nt<6>(w, xc, yc, n_in, n_out, s); break;
+            case 7: launch_q80_soa_km_nt<7>(w, xc, yc, n_in, n_out, s); break;
+            default: launch_q80_soa_km_nt<8>(w, xc, yc, n_in, n_out, s); break;
+        }
+        c0 += nt;
+    }
+    launch_check();
+}
+
+void native_q6_k_soa_mmvq(const void* weights, const void* x_q8_1, float* y,
+                          int n_in, int n_out, int ncols, void* stream) {
+    validate_shape(n_in, ncols, 256);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights); validate_pointer(x_q8_1); validate_pointer(y); validate_stream(stream);
+    const auto* w = static_cast<const uint8_t*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const int K_blk = n_in >> 5;
+    for (int c0 = 0; c0 < ncols; ) {
+        const int rem = ncols - c0;
+        const int nt = rem >= 8 ? 8 : rem;
+        const Q81Block* xc = x + (std::size_t) c0 * K_blk;
+        float* yc = y + (std::size_t) c0 * n_out;
+        switch (nt) {
+            case 1: launch_q6k_soa_km_nt<1>(w, xc, yc, n_in, n_out, s); break;
+            case 2: launch_q6k_soa_km_nt<2>(w, xc, yc, n_in, n_out, s); break;
+            case 3: launch_q6k_soa_km_nt<3>(w, xc, yc, n_in, n_out, s); break;
+            case 4: launch_q6k_soa_km_nt<4>(w, xc, yc, n_in, n_out, s); break;
+            case 5: launch_q6k_soa_km_nt<5>(w, xc, yc, n_in, n_out, s); break;
+            case 6: launch_q6k_soa_km_nt<6>(w, xc, yc, n_in, n_out, s); break;
+            case 7: launch_q6k_soa_km_nt<7>(w, xc, yc, n_in, n_out, s); break;
+            default: launch_q6k_soa_km_nt<8>(w, xc, yc, n_in, n_out, s); break;
+        }
+        c0 += nt;
+    }
+    launch_check();
+}
+
 } // namespace
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
@@ -1367,6 +2707,10 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+    if (p100_mmvq_try_q6k(weights, x_q8_1, y, n_in, n_out, ncols, static_cast<cudaStream_t>(stream))) {
+        launch_check();
+        return;
+    }
     if (ncols > 1) {
         launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         launch_check();
@@ -1420,6 +2764,16 @@ void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+    validate_shape(n_in, ncols, 32);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    if (p100_mmvq_try_q80(weights, x_q8_1, y, n_in, n_out, ncols, static_cast<cudaStream_t>(stream))) {
+        launch_check();
+        return;
+    }
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
@@ -1438,11 +2792,176 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
     small_f32<IQ4NLBlock, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+bool p100_soa_enabled() noexcept {
+    static const bool on = [] {
+        const char* v = std::getenv("MAYA_P100_SOA");
+        if (v != nullptr) return std::atoi(v) != 0;
+        return p100_is_sm60();
+    }();
+    return on;
+}
+
+int native_repack_to_soa_host(int ggml_type, const void* src, void* dst,
+                              int n_in, int n_out, bool row_major) {
+    if (!src || !dst || n_in <= 0 || n_out <= 0 || (n_out % 32 != 0)) return ggml_type;
+    if (ggml_type == 8 && (n_in % 32 == 0)) {
+        const int K_blk = n_in / 32;
+        const auto* s = static_cast<const Q80Block*>(src);
+        auto* wq = static_cast<uint8_t*>(dst);
+        auto* wd = reinterpret_cast<uint16_t*>(wq + (std::size_t) n_in * (std::size_t) n_out);
+        if (row_major) {
+            for (int r = 0; r < n_out; ++r) {
+                for (int b = 0; b < K_blk; ++b) {
+                    const Q80Block& blk = s[(std::size_t) r * K_blk + b];
+                    uint8_t* dq = wq + ((std::size_t) r * n_in + (std::size_t) b * 32);
+                    for (int i = 0; i < 32; ++i) dq[i] = static_cast<uint8_t>(blk.qs[i]) ^ 0x80u;
+                    std::memcpy(wd + (std::size_t) r * K_blk + b, &blk.d, 2);
+                }
+            }
+            return kGgmlQ8_0_SOA_RM;
+        }
+        for (int r = 0; r < n_out; ++r) {
+            for (int b = 0; b < K_blk; ++b) {
+                const Q80Block& blk = s[(std::size_t) r * K_blk + b];
+                uint8_t* dq0 = wq + (((std::size_t) (b * 2 + 0) * n_out + r) * 16);
+                uint8_t* dq1 = wq + (((std::size_t) (b * 2 + 1) * n_out + r) * 16);
+                for (int i = 0; i < 16; ++i) dq0[i] = static_cast<uint8_t>(blk.qs[i]) ^ 0x80u;
+                for (int i = 0; i < 16; ++i) dq1[i] = static_cast<uint8_t>(blk.qs[16 + i]) ^ 0x80u;
+                std::memcpy(wd + (std::size_t) b * n_out + r, &blk.d, 2);
+            }
+        }
+        return kGgmlQ8_0_SOA;
+    }
+    if (ggml_type == 14 && (n_in % 256 == 0) && !row_major) {
+        const int K_blk = n_in / 256;
+        const auto* s = static_cast<const Q6KBlock*>(src);
+        auto* base = static_cast<uint8_t*>(dst);
+        uint8_t* wql = base;
+        uint8_t* wqh = wql + (std::size_t) K_blk * 128 * n_out;
+        uint8_t* wsc = wqh + (std::size_t) K_blk * 64 * n_out;
+        auto* wd = reinterpret_cast<uint16_t*>(wsc + (std::size_t) K_blk * 16 * n_out);
+        for (int r = 0; r < n_out; ++r) {
+            for (int b = 0; b < K_blk; ++b) {
+                const Q6KBlock& blk = s[(std::size_t) r * K_blk + b];
+                for (int q = 0; q < 8; ++q)
+                    std::memcpy(wql + (((std::size_t) (b * 8 + q) * n_out + r) * 16), blk.ql + q * 16, 16);
+                for (int q = 0; q < 4; ++q)
+                    std::memcpy(wqh + (((std::size_t) (b * 4 + q) * n_out + r) * 16), blk.qh + q * 16, 16);
+                std::memcpy(wsc + (((std::size_t) b * n_out + r) * 16), blk.scales, 16);
+                std::memcpy(wd + (std::size_t) b * n_out + r, &blk.d, 2);
+            }
+        }
+        return kGgmlQ6_K_SOA;
+    }
+    return ggml_type;
+}
+
+namespace {
+__global__ void gather_q6k_soa_rows_kernel(const uint8_t* __restrict__ src, int K_blk, int src_rows,
+                                           const int32_t* __restrict__ ids, int dst_rows, uint8_t* __restrict__ dst) {
+    const int r = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= dst_rows) return;
+    const int sr = ids[r];
+    const uint4* s_ql = reinterpret_cast<const uint4*>(src);
+    const uint4* s_qh = s_ql + (std::size_t) K_blk * 8 * src_rows;
+    const uint4* s_sc = s_qh + (std::size_t) K_blk * 4 * src_rows;
+    const __half* s_d = reinterpret_cast<const __half*>(s_sc + (std::size_t) K_blk * src_rows);
+
+    uint4* d_ql = reinterpret_cast<uint4*>(dst);
+    uint4* d_qh = d_ql + (std::size_t) K_blk * 8 * dst_rows;
+    uint4* d_sc = d_qh + (std::size_t) K_blk * 4 * dst_rows;
+    __half* d_d = reinterpret_cast<__half*>(d_sc + (std::size_t) K_blk * dst_rows);
+
+    for (int p = 0; p < K_blk * 8; ++p)
+        d_ql[(std::size_t) p * dst_rows + r] = s_ql[(std::size_t) p * src_rows + sr];
+    for (int p = 0; p < K_blk * 4; ++p)
+        d_qh[(std::size_t) p * dst_rows + r] = s_qh[(std::size_t) p * src_rows + sr];
+    for (int p = 0; p < K_blk; ++p) {
+        d_sc[(std::size_t) p * dst_rows + r] = s_sc[(std::size_t) p * src_rows + sr];
+        d_d[(std::size_t) p * dst_rows + r]  = s_d[(std::size_t) p * src_rows + sr];
+    }
+}
+
+__global__ void gather_q80_soa_rows_kernel(const uint8_t* __restrict__ src, int K_blk, int src_rows,
+                                           const int32_t* __restrict__ ids, int dst_rows, uint8_t* __restrict__ dst) {
+    const int r = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= dst_rows) return;
+    const int sr = ids[r];
+    const uint4* s_q = reinterpret_cast<const uint4*>(src);
+    const __half* s_d = reinterpret_cast<const __half*>(s_q + (std::size_t) K_blk * 2 * src_rows);
+    uint4* d_q = reinterpret_cast<uint4*>(dst);
+    __half* d_d = reinterpret_cast<__half*>(d_q + (std::size_t) K_blk * 2 * dst_rows);
+
+    for (int p = 0; p < K_blk * 2; ++p)
+        d_q[(std::size_t) p * dst_rows + r] = s_q[(std::size_t) p * src_rows + sr];
+    for (int p = 0; p < K_blk; ++p)
+        d_d[(std::size_t) p * dst_rows + r] = s_d[(std::size_t) p * src_rows + sr];
+}
+}  // namespace
+
+void native_q6_k_soa_gather_rows(const void* src_soa, int n_in, int src_rows,
+                                 const int32_t* ids, int dst_rows, void* dst_soa, void* stream) {
+    if (dst_rows <= 0) return;
+    validate_shape(n_in, 1, 256);
+    validate_pointer(src_soa); validate_pointer(ids); validate_pointer(dst_soa);
+    const int K_blk = n_in >> 8;
+    const unsigned blocks = unsigned((dst_rows + 255) / 256);
+    gather_q6k_soa_rows_kernel<<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint8_t*>(src_soa), K_blk, src_rows, ids, dst_rows, static_cast<uint8_t*>(dst_soa));
+    launch_check();
+}
+
+void native_q8_0_soa_gather_rows(const void* src_soa, int n_in, int src_rows,
+                                 const int32_t* ids, int dst_rows, void* dst_soa, void* stream) {
+    if (dst_rows <= 0) return;
+    validate_shape(n_in, 1, 32);
+    validate_pointer(src_soa); validate_pointer(ids); validate_pointer(dst_soa);
+    const int K_blk = n_in >> 5;
+    const unsigned blocks = unsigned((dst_rows + 255) / 256);
+    gather_q80_soa_rows_kernel<<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint8_t*>(src_soa), K_blk, src_rows, ids, dst_rows, static_cast<uint8_t*>(dst_soa));
+    launch_check();
+}
+
+void native_q8_0_soa_mmvq_dual(const void* wA, const void* wB, const void* x_q8_1,
+                               float* yA, float* yB, int n_in, int n_out_A, int n_out_B,
+                               int ncols, void* stream) {
+    validate_shape(n_in, ncols, 32);
+    if (n_out_A <= 0 || n_out_B <= 0) throw std::invalid_argument("native dual MMVQ requires positive n_out");
+    validate_pointer(wA); validate_pointer(wB); validate_pointer(x_q8_1);
+    validate_pointer(yA); validate_pointer(yB); validate_stream(stream);
+    const auto* a = static_cast<const uint8_t*>(wA);
+    const auto* b = static_cast<const uint8_t*>(wB);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const int K_blk = n_in >> 5;
+    for (int c0 = 0; c0 < ncols; ) {
+        const int rem = ncols - c0;
+        const int nt = rem >= 8 ? 8 : rem;
+        const Q81Block* xc = x + (std::size_t) c0 * K_blk;
+        float* yAc = yA + (std::size_t) c0 * n_out_A;
+        float* yBc = yB + (std::size_t) c0 * n_out_B;
+        switch (nt) {
+            case 1: launch_q80_soa_dual_nt<1>(a, b, xc, yAc, yBc, n_in, n_out_A, n_out_B, s); break;
+            case 2: launch_q80_soa_dual_nt<2>(a, b, xc, yAc, yBc, n_in, n_out_A, n_out_B, s); break;
+            case 3: launch_q80_soa_dual_nt<3>(a, b, xc, yAc, yBc, n_in, n_out_A, n_out_B, s); break;
+            case 4: launch_q80_soa_dual_nt<4>(a, b, xc, yAc, yBc, n_in, n_out_A, n_out_B, s); break;
+            case 5: launch_q80_soa_dual_nt<5>(a, b, xc, yAc, yBc, n_in, n_out_A, n_out_B, s); break;
+            case 6: launch_q80_soa_dual_nt<6>(a, b, xc, yAc, yBc, n_in, n_out_A, n_out_B, s); break;
+            case 7: launch_q80_soa_dual_nt<7>(a, b, xc, yAc, yBc, n_in, n_out_A, n_out_B, s); break;
+            default: launch_q80_soa_dual_nt<8>(a, b, xc, yAc, yBc, n_in, n_out_A, n_out_B, s); break;
+        }
+        c0 += nt;
+    }
+    launch_check();
+}
+
 bool native_mmvq_supported(int ggml_type) noexcept {
     return ggml_type == 2 || ggml_type == 6 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
+           ggml_type == 21 || ggml_type == 22 || ggml_type == 29 ||
+           ggml_type == kGgmlQ8_0_SOA || ggml_type == kGgmlQ8_0_SOA_RM || ggml_type == kGgmlQ6_K_SOA;
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
@@ -1450,12 +2969,12 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     switch (ggml_type) {
     case 2: block_elems = 32; block_bytes = 18; break;
     case 6: block_elems = 32; block_bytes = 22; break;
-    case 8: block_elems = 32; block_bytes = 34; break;
+    case 8: case kGgmlQ8_0_SOA: case kGgmlQ8_0_SOA_RM: block_elems = 32; block_bytes = 34; break;
     case 20: block_elems = 32; block_bytes = 18; break;
     case 11: block_elems = 256; block_bytes = 110; break;
     case 12: block_elems = 256; block_bytes = 144; break;
     case 13: block_elems = 256; block_bytes = 176; break;
-    case 14: block_elems = 256; block_bytes = 210; break;
+    case 14: case kGgmlQ6_K_SOA: block_elems = 256; block_bytes = 210; break;
     case 23: block_elems = 256; block_bytes = 136; break;
     case 42: block_elems = 64; block_bytes = 18; break;
     case 16: case 17: case 18: case 19: case 21: case 22: case 29:
@@ -1477,11 +2996,13 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case kGgmlQ8_0_SOA: native_q8_0_soa_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 12: native_q4_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 13: native_q5_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case kGgmlQ6_K_SOA: native_q6_k_soa_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 16: case 17: case 18: case 19: case 21: case 22: case 29:

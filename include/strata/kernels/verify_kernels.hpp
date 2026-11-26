@@ -34,7 +34,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 /// *n_keep tokens are run and the state is written (commit; `y` may be scratch).  Bitwise `fused_gdn_step_norm`.
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin = 0);
+                         const int32_t* n_keep, void* stream, int t_out_begin = 0, void* y_q8 = nullptr);
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
@@ -47,7 +47,14 @@ void gpu_stamp(unsigned long long* buf, int i, void* stream);
 /// routing order, their entries ascending), no PCIe groups.  *skip = ring when it did, else 0.
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
-                   long long capx, uint32_t* skip, uint32_t ring, void* stream);
+                   long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* miss_flag = nullptr);
+/// Fused exact top-10 router + resident_plan (512 experts, k=10, 1..8 tokens) in a single block: eliminates
+/// global ids round-trip, 1 kernel launch/drain per layer, and unused __threadfence() on 100% resident fast-path.
+void fused_router_top10_resident_plan(const float* logits, int n_tok, int32_t* ids, float* weights,
+                                      const int32_t* res_layer, const uint8_t* cache_base,
+                                      const unsigned long long* slot_off, long long blob, int32_t* plan,
+                                      long long capx, uint32_t* skip, uint32_t ring, void* stream,
+                                      uint32_t* miss_flag = nullptr);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
@@ -56,6 +63,9 @@ void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, 
 /// copy_from_mapped, or zeros when *skip == value (n a multiple of 4, 16-byte aligned).
 void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
                               void* stream);
+/// copy_from_mapped unless *skip == value (skips writing zeros when combine reads hit_out directly).
+void copy_from_mapped_unless(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
+                             void* stream);
 
 /// Rows of the S2/S4/S8 embedding for T token ids read from DEVICE memory; out (T, n).  Bitwise `embedding_gather`.
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
@@ -82,17 +92,25 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 /// row = *row_dev (device memory).  `out` may be mapped host memory.
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs = nullptr,
-                float* out_p = nullptr);
+                float* out_p = nullptr, uint32_t* done_flag = nullptr, uint32_t done_val = 0u);
 /// dst row i = src row ids[i] (row_bytes each, multiple of 16), for n rows.
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream);
 /// ids[t] = table[ids[t]] for n entries (a subset index back to a token id).
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream);
 /// probs[t] = softmax(logits[t])[ids[t]] for n_rows rows of n_vocab (the probability of each row's argmax).
 void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream);
+/// Fused single-pass online-softmax greedy argmax + top-1 probability + optional dvocab remap for MTP draft steps.
+void mtp_greedy_prob_map(const float* logits, int n_rows, int n_vocab, const int32_t* dvocab,
+                         int32_t* out_ids, float* probs, void* stream);
 /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// A sliding attention window: for `n` step records (kStepCount ints each, n_kv at [1]) the selection becomes the
 /// last `window` cells: ids[q * ids_stride + j] = max(0, n_kv - window) + j and the record's width = the count.
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream);
+/// Fused stage hand-off pack/unpack (1 launch for all T tokens instead of 3*T copy_from_mapped launches).
+void handoff_pack(float* hand_out, const float* R, const float* bo, const float* inj2,
+                  int64_t hc_n, int64_t n, int64_t hc, int64_t hb, int n_tok, void* stream);
+void handoff_unpack(float* R, float* bo, float* inj2, const float* hand_in,
+                    int64_t hc_n, int64_t n, int64_t hc, int64_t hb, int n_tok, void* stream);
 
 }  // namespace strata::kernels

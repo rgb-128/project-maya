@@ -142,18 +142,35 @@ __global__ void conv_residual_batch_kernel(const float* history, const float* no
     const float activation = sum / (1.0f + expf(-sum));
     hidden[i] = __fadd_rn(hidden[i], __fadd_rn(gated[i], activation));
 }
-// the history after the chunk: the last nine normalized rows (older ones from the history when T < 9)
-__global__ void history_batch_kernel(float* history, const float* normalized, int T) {
+// the history after the chunk: optionally records hist_snap[t] after each token t=0..T-1 and updates history
+__global__ void history_batch_kernel(float* history, const float* normalized, int T, float* hist_snap) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= D) return;
     float h[HISTORY];
 #pragma unroll
+    for (int r = 0; r < HISTORY; ++r) h[r] = history[size_t(c) * HISTORY + r];
+    if (hist_snap != nullptr) {
+        const size_t HS = size_t(HISTORY) * D;
+        for (int t = 0; t < T; ++t) {
+#pragma unroll
+            for (int r = 0; r + 1 < HISTORY; ++r) h[r] = h[r + 1];
+            h[HISTORY - 1] = normalized[size_t(t) * D + c];
+            float* snap_col = hist_snap + size_t(t) * HS + size_t(c) * HISTORY;
+#pragma unroll
+            for (int r = 0; r < HISTORY; ++r) snap_col[r] = h[r];
+        }
+#pragma unroll
+        for (int r = 0; r < HISTORY; ++r) history[size_t(c) * HISTORY + r] = h[r];
+        return;
+    }
+    float out_h[HISTORY];
+#pragma unroll
     for (int r = 0; r < HISTORY; ++r) {
         const int p = T - HISTORY + r;
-        h[r] = p >= 0 ? normalized[size_t(p) * D + c] : history[size_t(c) * HISTORY + (T + r)];
+        out_h[r] = p >= 0 ? normalized[size_t(p) * D + c] : h[T + r];
     }
 #pragma unroll
-    for (int r = 0; r < HISTORY; ++r) history[size_t(c) * HISTORY + r] = h[r];
+    for (int r = 0; r < HISTORY; ++r) history[size_t(c) * HISTORY + r] = out_h[r];
 }
 
 struct Span { const void* p; size_t bytes; size_t alignment; };
@@ -203,7 +220,8 @@ void native_ple_postops(const float* projected_key, const float* hidden,
 }
 
 void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
-                              float* query_norm, float* gated, float* gate, int T, void* stream) {
+                              float* query_norm, float* gated, float* gate, int T, void* stream,
+                              float* hist_snap) {
     if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate)
         throw std::invalid_argument("native PLE postops batch: null input or empty batch");
     auto st = static_cast<cudaStream_t>(stream);
@@ -215,7 +233,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
     broadcast_batch_kernel<<<blocks, 256, 0, st>>>(value, gate, gated, T);
     rms_rep_kernel<<<rows, 1024, 0, st>>>(gated, w.norm_conv, query_norm);
     conv_residual_batch_kernel<<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, T);
-    history_batch_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T);
+    history_batch_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T, hist_snap);
     launch_check();
 }
 } // namespace strata::kernels

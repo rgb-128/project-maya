@@ -158,14 +158,19 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
 }
 
 // One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
-__global__ void copy_kernel(KvStreamMap m, Runs r) {
+// Unrolled constant-indexed run loop eliminates STACK:88 local spill of Runs struct!
+__global__ void __launch_bounds__(128) copy_kernel(KvStreamMap m, Runs r) {
     const int need = m.ctl[2];
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
-        for (int a = 0; a < r.n; ++a) {
-            const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
-            uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + sl * r.len[a]);
-            for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) dst[i] = src[i];
+#pragma unroll
+        for (int a = 0; a < 4; ++a) {
+            if (a < r.n) {
+                const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
+                uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + sl * r.len[a]);
+                const int n16 = r.len[a] >> 4;
+                for (int i = threadIdx.x; i < n16; i += blockDim.x) dst[i] = src[i];
+            }
         }
     }
 }

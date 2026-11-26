@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -101,9 +102,26 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 
 // Storage/dispatch helpers take stable GGML type IDs, avoiding a ggml runtime
 // dependency in the engine: Q4_0=2, Q5_0=6, Q8_0=8, Q3_K=11, Q4_K=12, Q5_K=13,
-// Q6_K=14, IQ4_NL=20, IQ4_XS=23, Q2_0=42. Unsupported IDs throw in the byte-count
-// and launch helpers; only the
-// capability query returns false.
+// Q6_K=14, IQ4_NL=20, IQ4_XS=23, Q2_0=42.
+// GP100 K-major/row-major SoA repacked layouts (exact same byte count, 16-byte aligned LDG.E.128):
+//   kGgmlQ8_0_SOA    = 108 (K-major SoA Q8_0, biased +128 uint8_t qs + __half d)
+//   kGgmlQ8_0_SOA_RM = 109 (Row-major SoA Q8_0, biased +128 uint8_t qs + __half d, for skinny-N hc_down)
+//   kGgmlQ6_K_SOA    = 114 (K-major SoA Q6_K: Wql[K/256][8][N], Wqh[K/256][4][N], Wsc[K/256][N], Wd[K/256][N])
+constexpr int kGgmlQ8_0_SOA = 108;
+constexpr int kGgmlQ8_0_SOA_RM = 109;
+constexpr int kGgmlQ6_K_SOA = 114;
+
+bool p100_soa_enabled() noexcept;
+int native_repack_to_soa_host(int ggml_type, const void* src, void* dst,
+                              int n_in, int n_out, bool row_major = false);
+void native_q6_k_soa_gather_rows(const void* src_soa, int n_in, int src_rows,
+                                 const int32_t* ids, int dst_rows, void* dst_soa, void* stream);
+void native_q8_0_soa_gather_rows(const void* src_soa, int n_in, int src_rows,
+                                 const int32_t* ids, int dst_rows, void* dst_soa, void* stream);
+void native_q8_0_soa_mmvq_dual(const void* wA, const void* wB, const void* x_q8_1,
+                               float* yA, float* yB, int n_in, int n_out_A, int n_out_B,
+                               int ncols, void* stream);
+
 bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,

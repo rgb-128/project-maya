@@ -39,4 +39,11 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                int64_t max_cells, float freq_base, void* stream);
 
+// Batched graph-capturable append of `n_tok` tokens whose device positions live at `pos_dev[t * pos_stride]`.
+// Positions < 0 or >= max_cells are skipped defensively (matching single `append`).
+void native_qsa_indexer_append_multi(const float* raw, const int32_t* relative_pos_device,
+                                     int pos_stride, int n_tok, int32_t pos_base, const float* gamma,
+                                     float epsilon, const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
+                                     int64_t max_cells, float freq_base, void* stream);
+
 } // namespace strata::kernels

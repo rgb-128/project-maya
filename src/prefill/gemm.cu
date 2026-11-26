@@ -1,7 +1,11 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
+#include "strata/cuda_compat/pascal_gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/prefill/failure.hpp"
+#if defined(STRATA_PREFILL_MMQ) && !defined(__HIPCC__)
+#include "strata/prefill/moe_pascal.hpp"
+#endif
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -397,6 +401,15 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     }
 #endif
     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
+#if defined(STRATA_PREFILL_MMQ) && !defined(__HIPCC__)
+    if (beta == 0.0f) {
+        pascal::Dense dd{W, N, K, X, K, T, Y, ldy, 0};
+        if (pascal::dense_bf16_usable(dd)) {
+            pascal::dense_bf16_run(dd, stream_);
+            return;
+        }
+    }
+#endif
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16BF, (int) K, X, CUDA_R_16BF, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
@@ -413,15 +426,37 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                       beta, stream_)) {
         return;
     }
+#elif defined(STRATA_PREFILL_MMQ)
+    // Pascal GP100 (sm_60): HFMA2 128x64 dense GEMM runs at ~12 TFLOPS vs cuBLAS FP32 ~6 TFLOPS,
+    // with ZERO cuBLAS host mutex contention across concurrent multi-GPU pipeline threads!
+    if (beta == 0.0f) {
+        pascal::Dense dd{W, N, K, X, K, T, Y, ldy, 0};
+        if (pascal::dense_usable(dd)) {
+            pascal::dense_run(dd, stream_);
+            return;
+        }
+    }
 #endif
     ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
                     CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
-                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                    CUBLAS_COMPUTE_32F, STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT, T)),
        "cublasGemmEx f16");
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta) {
+    if (T <= 0 || N <= 0) return;
+    if (ldy <= 0) ldy = N;
+#if defined(STRATA_PREFILL_MMQ) && !defined(__HIPCC__)
+    if (beta == 0.0f && (ggml_type == 108 || ggml_type == 109)) {
+        pascal::Dense dd{W_blocks, N, K, X, K, T, Y, ldy, 0};
+        if (pascal::dense_q80_soa_usable(dd)) {
+            if (ggml_type == 108) pascal::dense_q80_soa_run(dd, stream_);
+            else pascal::dense_q80_soa_rm_run(dd, stream_);
+            return;
+        }
+    }
+#endif
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
@@ -432,12 +467,12 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
-            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
+            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_, N);
             f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
         }
         return;
     }
-    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_, N);
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }
 

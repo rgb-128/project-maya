@@ -263,6 +263,42 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
     copy_rows_from_mapped_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>((float4*) dst, (const volatile float4*) src,
                                                                                   width / 4, hit_rows, count);
 }
+__global__ void copy_miss_rows_into_hit_unless_kernel(float4* __restrict__ hit_out, const volatile float4* src,
+                                                      int64_t row4, const int32_t* __restrict__ hit_rows,
+                                                      const int32_t* __restrict__ count, const uint32_t* __restrict__ skip,
+                                                      uint32_t ring) {
+    if (skip != nullptr && *skip == ring) return;
+    const int row = blockIdx.x;
+    __shared__ int hit;
+    if (threadIdx.x == 0) {
+        int h = 0;
+        const int c = *count;
+        for (int i = 0; i < c; ++i) h |= (hit_rows[i] == row);
+        hit = h;
+    }
+    __syncthreads();
+    if (hit) return;
+    float4* d = hit_out + (int64_t) row * row4;
+    const float4* sr = const_cast<const float4*>(src) + (int64_t) row * row4;
+    for (int64_t i = threadIdx.x; i < row4; i += blockDim.x) {
+#if defined(__CUDA_ARCH__)
+        d[i] = __ldcv(sr + i);
+#else
+        d[i] = sr[i];
+#endif
+    }
+}
+void copy_miss_rows_into_hit_unless(float* hit_out, const float* src, int64_t rows, int64_t width,
+                                    const int32_t* hit_rows, const int32_t* count, const uint32_t* skip,
+                                    uint32_t ring, void* stream) {
+    if (rows <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) hit_out & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "copy_miss_rows_into_hit_unless: width must be a multiple of 4 and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    copy_miss_rows_into_hit_unless_kernel<<<(unsigned) rows, 128, 0, (cudaStream_t) stream>>>(
+        (float4*) hit_out, (const volatile float4*) src, width / 4, hit_rows, count, skip, ring);
+}
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
@@ -278,7 +314,14 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
 __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                         const float* __restrict__ w, int n, int k, float* x_out, int32_t* ids_out,
                                         float* w_out, uint32_t* seq) {
-    for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+    if ((n & 3) == 0 && (((uintptr_t) x | (uintptr_t) x_out) & 15u) == 0) {
+        const int n4 = n >> 2;
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        float4* o4 = reinterpret_cast<float4*>(x_out);
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) o4[i] = x4[i];
+    } else {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+    }
     if ((int) threadIdx.x < k) { ids_out[threadIdx.x] = ids[threadIdx.x]; w_out[threadIdx.x] = w[threadIdx.x]; }
     __threadfence_system();
     __syncthreads();
@@ -297,6 +340,89 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
     doorbell_publish_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, weights, (int) n, (int) k, x_out, ids_out,
                                                                     weights_out, d_seq);
     check_launch("doorbell_publish");
+}
+
+__global__ void doorbell_publish_unless_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
+                                               const float* __restrict__ w, int n, int k, float* x_out,
+                                               int32_t* ids_out, float* w_out, uint32_t* seq,
+                                               const uint32_t* __restrict__ skip, uint32_t ring,
+                                               uint32_t* miss_k_out, uint32_t k_val) {
+    if (*skip == ring) return;
+    if ((n & 3) == 0 && (((uintptr_t) x | (uintptr_t) x_out) & 15u) == 0) {
+        const int n4 = n >> 2;
+        const float4* x4 = reinterpret_cast<const float4*>(x);
+        float4* o4 = reinterpret_cast<float4*>(x_out);
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) o4[i] = x4[i];
+    } else {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+    }
+    if ((int) threadIdx.x < k) { ids_out[threadIdx.x] = ids[threadIdx.x]; w_out[threadIdx.x] = w[threadIdx.x]; }
+    if (threadIdx.x == 0) *(volatile uint32_t*) miss_k_out = k_val;
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+#if defined(__HIPCC__)
+        __threadfence_system();
+#endif
+    }
+}
+
+void doorbell_publish_unless(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k,
+                             float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq,
+                             const uint32_t* skip, uint32_t ring, uint32_t* d_miss_k, uint32_t k_val, void* stream) {
+    if (k > 1024) { std::fprintf(stderr, "doorbell_publish_unless: k too large\n"); std::exit(1); }
+    doorbell_publish_unless_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(
+        x, ids, weights, (int) n, (int) k, x_out, ids_out, weights_out, d_seq, skip, ring, d_miss_k, k_val);
+    check_launch("doorbell_publish_unless");
+}
+
+__global__ void signal_done_flag_kernel(uint32_t* d_done, uint32_t val) {
+    __threadfence_system();
+    *(volatile uint32_t*) d_done = val;
+#if defined(__HIPCC__)
+    __threadfence_system();
+#endif
+}
+
+void signal_done_flag(uint32_t* d_done, uint32_t val, void* stream) {
+    signal_done_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(d_done, val);
+    check_launch("signal_done_flag");
+}
+
+__global__ void moe_route_trunc_kernel(int32_t* __restrict__ ids, float* __restrict__ w, int k, int keep,
+                                       float skip_w) {
+    const int t = (int) blockIdx.x;
+    ids += (size_t) t * (size_t) k;
+    w += (size_t) t * (size_t) k;
+    if (threadIdx.x != 0) return;
+    int nkeep = keep > 0 && keep < k ? keep : k;
+    if (skip_w > 0.0f) {
+        int live = 0;
+        for (int i = 0; i < nkeep; ++i) {
+            if (w[i] >= skip_w) {
+                if (live != i) { ids[live] = ids[i]; w[live] = w[i]; }
+                ++live;
+            }
+        }
+        if (live == 0) { nkeep = 1; }  // never drop the heaviest
+        else nkeep = live;
+    }
+    float s = 0.0f;
+    for (int i = 0; i < nkeep; ++i) s += w[i];
+    const float inv = 1.0f / fmaxf(s, 1e-6f);
+    for (int i = 0; i < nkeep; ++i) w[i] *= inv;
+    // Dropped slots: id=-1 + weight 0. The pool/GPU plan must skip id<0 (and w==0); rewriting to ids[0]
+    // used to keep plan entry count at k and re-run the heaviest expert for every dropped slot.
+    for (int i = nkeep; i < k; ++i) { ids[i] = -1; w[i] = 0.0f; }
+}
+
+void moe_route_trunc(int32_t* ids, float* weights, int64_t n_tok, int64_t k, int keep, float skip_w, void* stream) {
+    if (n_tok < 1 || k < 1 || ids == nullptr || weights == nullptr || stream == nullptr) return;
+    if ((keep <= 0 || keep >= (int) k) && skip_w <= 0.0f) return;
+    moe_route_trunc_kernel<<<(unsigned) n_tok, 32, 0, (cudaStream_t) stream>>>(ids, weights, (int) k, keep, skip_w);
+    check_launch("moe_route_trunc");
 }
 
 __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {

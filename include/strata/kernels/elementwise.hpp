@@ -106,12 +106,31 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).
 void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
                            const int32_t* count, void* stream);
+/// Zero-copy direct-into-hit_out: if *skip == ring, returns immediately; otherwise copies ONLY the rows NOT listed
+/// in hit_rows[0, *count) (i.e. CPU-computed misses) from mapped host `src` directly into `hit_out`, touching zero
+/// bytes for GPU/PCIe hits so combine can read `hit_out` directly (eliminating parts_ copy + moe_hit_add!).
+void copy_miss_rows_into_hit_unless(float* hit_out, const float* src, int64_t rows, int64_t width,
+                                    const int32_t* hit_rows, const int32_t* count, const uint32_t* skip,
+                                    uint32_t ring, void* stream);
 
 /// Plan v0.3 P3: the doorbell's payload and its ring in ONE kernel.  Copies `x` (n floats), `ids` and `weights`
 /// (k each) into the mapped host regions, fences, and increments the mapped sequence number - replacing three
 /// device-to-host memcpy nodes (copy-engine operations in the middle of the layer chain) and the ring kernel.
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream);
+/// Resident fast-path: if *skip == ring (all experts in VRAM), returns immediately with zero PCIe traffic and no host
+/// wakeup. Otherwise publishes payload, writes *d_miss_k = k_val, fences, and increments *d_seq.
+void doorbell_publish_unless(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k,
+                             float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq,
+                             const uint32_t* skip, uint32_t ring, uint32_t* d_miss_k, uint32_t k_val, void* stream);
+/// Write `val` to mapped host flag `d_done` after a system fence (end-of-graph completion signal, zero driver poll).
+void signal_done_flag(uint32_t* d_done, uint32_t val, void* stream);
+
+/// Qwen turbo (changes answers): after top-k routing, keep at most `keep` heaviest experts (already sorted) and/or
+/// drop any whose share is below `skip_w`, then renormalise the kept weights. Dropped slots get id=-1 and weight 0
+/// so the expert pool / GPU plan omit them (no GEMV, no plan entry). `keep<=0` or `keep>=k` keeps all ranks;
+/// `skip_w<=0` skips the weight bar. No-op when both are inactive. Exact when trunc is off.
+void moe_route_trunc(int32_t* ids, float* weights, int64_t n_tok, int64_t k, int keep, float skip_w, void* stream);
 
 /// Plan v0.3 P3: copy `n` int32 from mapped pinned host memory into device memory with a kernel (the QSA
 /// per-token step and positions), instead of a host-to-device memcpy node in the middle of a layer.

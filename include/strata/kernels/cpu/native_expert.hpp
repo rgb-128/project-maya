@@ -51,6 +51,10 @@ bool native_fmt_mixed(int gate_type, int up_type, int d_type, int64_t n_embd, in
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes).
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
+/// Block geometry of f.d_act (for block-aligned fused quantization in ExpertPool).
+void native_quant_h_info(const NativeFmt& f, int& blck_size, size_t& type_size);
+/// Quantize a block-aligned slice of `n_elems` floats into `dst` (for fused mode=5).
+void native_quant_h_range(const NativeFmt& f, const float* h, void* dst, int n_elems);
 
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens.
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,

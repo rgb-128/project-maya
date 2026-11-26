@@ -181,12 +181,47 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
     if (n_ < 1) n_ = 1;
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
+    wdone_.reset(new WorkerDone[(size_t) n_]);
+    w_node_.assign((size_t) n_, 0);
+    fast_rank_all_.assign((size_t) n_, 0);
+    fast_rank_node_.assign((size_t) n_, 0);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
     g_diag_pool.store(this);
     strata::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
+    auto cpu_pkg = [](int core) -> int {
+#if !defined(_WIN32)
+        if (core < 0) return 0;
+        char path[96];
+        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", core);
+        long v = 0;
+        if (std::FILE* f = std::fopen(path, "r")) {
+            if (std::fscanf(f, "%ld", &v) != 1) v = 0;
+            std::fclose(f);
+        }
+        return (v == 1) ? 1 : 0;
+#else
+        (void) core;
+        return 0;
+#endif
+    };
+    for (int i = 0; i < n_; ++i) {
+        const int core = pin ? (i < (int) cores.size() ? cores[(size_t) i] : -1) : -1;
+        const int nd = cpu_pkg(core);
+        w_node_[(size_t) i] = nd;
+        node_workers_[nd].push_back(i);
+        fast_rank_all_[(size_t) i] = (host_works_ ? 1 : 0) + i;
+    }
+    n_numa_nodes_ = (!node_workers_[0].empty() && !node_workers_[1].empty()) ? 2 : 1;
+    // In NUMA-local mode: Node 0 uses host (rank 0, core 0) + Node 0 workers (ranks 1..W0);
+    // Node 1 uses Node 1 workers (ranks 0..W1-1, zero cross-socket host reads!).
+    for (size_t k = 0; k < node_workers_[0].size(); ++k)
+        fast_rank_node_[(size_t) node_workers_[0][k]] = (host_works_ ? 1 : 0) + (int) k;
+    for (size_t k = 0; k < node_workers_[1].size(); ++k)
+        fast_rank_node_[(size_t) node_workers_[1][k]] = (int) k;
+
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
         const int core = pin ? (i < (int) cores.size() ? cores[(size_t) i] : -1) : -1;
@@ -220,27 +255,15 @@ void ExpertPool::publish() {
 }
 
 void ExpertPool::worker(int id) {
+    const int my_node = w_node_[(size_t) id];
     uint32_t seen = 0;
-    // ARRIVE at the park before the first wait, so `parked_ == n_` is true from construction.  Counting only
-    // on the RETURN from a drain leaves `parked_` at 0 until each worker has finished one batch, and the first
-    // `run()` - which waits for `parked_ == n_` before publishing - then deadlocks.  It deadlocks on the very
-    // first call, which is the good case; a version that deadlocked on the second would be far worse.
+    uint32_t seen_fast = 0;
     parked_.fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
-        // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the
-        // sibling hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these
-        // iterations are spent here with nothing to do.
-        //
-        // **AND NOTHING ELSE HAPPENS IN HERE.**  This loop used to do `pauses_.fetch_add(1)` on every iteration
-        // - a locked read-modify-write, five workers against one cache line - so the workers spent their wait
-        // invalidating each other's caches and the very line the host writes to publish work.  The counter was
-        // diagnostic and nothing branched on it.  See the note on the atomics in pool.hpp.
-        //
-        // After `kSpinBeforeSleep` with no work the worker sleeps instead (issue #4).  The clock is read once
-        // every 1024 pauses, so the spin itself is unchanged.
         const auto parked_at = std::chrono::steady_clock::now();
         uint32_t spins = 0;
-        while (epoch_.load(std::memory_order_acquire) == seen) {
+        while (fast_epoch_[my_node].val.load(std::memory_order_acquire) == seen_fast &&
+               epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
             strata_cpu_pause();
             if ((++spins & 1023u) != 0) continue;
@@ -249,23 +272,161 @@ void ExpertPool::worker(int id) {
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
             sleep_cv_.wait(lk, [&] {
-                return epoch_.load(std::memory_order_seq_cst) != seen || stop_.load(std::memory_order_relaxed);
+                return fast_epoch_[my_node].val.load(std::memory_order_seq_cst) != seen_fast ||
+                       epoch_.load(std::memory_order_seq_cst) != seen ||
+                       stop_.load(std::memory_order_relaxed);
             });
             sleepers_.fetch_sub(1, std::memory_order_relaxed);
             wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
         }
         if (stop_.load(std::memory_order_acquire)) return;
+        const uint32_t fe = fast_epoch_[my_node].val.load(std::memory_order_acquire);
+        if (fe != seen_fast) {
+            seen_fast = fe;
+            const int rank = fast_use_numa_ ? fast_rank_node_[(size_t) id] : fast_rank_all_[(size_t) id];
+            run_fast_slice(rank, fast_n_part_, my_node);
+            wdone_[(size_t) id].val.store(fe, std::memory_order_release);
+            continue;
+        }
         // acquire: the batch this epoch published (`head`, and the description before it) is visible from here
         seen = epoch_.load(std::memory_order_acquire);
         parked_.fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
 
-        // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
-        // Every job is the same size (all experts are 1,382,400 bytes), so there is nothing to schedule.  Only
-        // this epoch's jobs: if the host has already moved on, the claims fail and the worker parks again.
         wstate_[(size_t) id].store(kBetween, std::memory_order_relaxed);
         drain(id, scratch_[(size_t) id], seen);
         wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
         parked_.fetch_add(1, std::memory_order_acq_rel);   // back at the park
+    }
+}
+
+void ExpertPool::run_fast_slice(int rank, int n_part, int worker_node) {
+    if (fast_mode_ == 8) {
+        if (rank < actq_n_) {
+            const int t = actq_toks_[rank];
+            native_quant_act(*nfmt_, actq_x_ + (size_t) t * (size_t) actq_H_, actq_dst_ + (size_t) t * actq_stride_);
+        }
+        return;
+    }
+    if (fast_mode_ == 7) {
+        // Parallel intermediate activation quantization across (e, t) pairs!
+        int idx = 0;
+        const bool q2_simd = (nfmt_->d_type == 42) && q2_own_kernels() && (cpu_avx2_ok() || cpu_avx512_ok());
+        for (int e = 0; e < fast_nb_; ++e) {
+            for (int t = 0; t < mjobs_[e].nt; ++t) {
+                if (idx % n_part == rank) {
+                    if (q2_simd)
+                        act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                    else
+                        native_quant_h(*nfmt_, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+                }
+                ++idx;
+            }
+        }
+        return;
+    }
+    const bool q2_simd = q2_own_kernels() && (cpu_avx2_ok() || cpu_avx512_ok());
+    if (fast_mode_ == 5 && fast_nb_ >= 2 && !(nfmt_->gu_type == 42 && q2_simd) && !(nfmt_->d_type == 42 && q2_simd)) {
+        int total_q = 0;
+        for (int e = 0; e < fast_nb_; ++e) total_q += mjobs_[e].nt;
+        int qk = 0;
+        size_t qts = 0;
+        native_quant_h_info(*nfmt_, qk, qts);
+        if (total_q >= 3 && qk > 0 && qk <= 64 && (FF % qk) == 0) {
+            // Wave 6: When nb >= 2 and total_q >= 3 (otherwise mode=7 isn't run and nb=1 needs full 24-core split),
+            // partition FF in qk-aligned blocks and fuse native_quant_h while sb.ff is hot in L1!
+            const int per_blk = FF / qk;
+            const int64_t total_blk = (int64_t) fast_nb_ * per_blk;
+            const int64_t b0 = total_blk * (int64_t) rank / n_part;
+            const int64_t b1 = total_blk * (int64_t) (rank + 1) / n_part;
+            for (int64_t bk = b0; bk < b1;) {
+                const int e = (int) (bk / per_blk), rb0 = (int) (bk % per_blk);
+                const int rb1 = (int) std::min<int64_t>(per_blk, rb0 + (b1 - bk));
+                const int r0 = rb0 * qk, r1 = rb1 * qk;
+                SplitBufMulti& sb = split_multi_[(size_t) e];
+                const uint8_t* const blob = (worker_node == 1 && mjobs_[e].blob_n1 != nullptr) ? mjobs_[e].blob_n1 : mjobs_[e].blob;
+                float* ff[MAXT];
+                for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+                native_gu_rows(*nfmt_, blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                for (int t = 0; t < mjobs_[e].nt; ++t) {
+                    native_quant_h_range(*nfmt_, sb.ff[t] + r0,
+                                         reinterpret_cast<uint8_t*>(sb.hq[t]) + (size_t) rb0 * qts, r1 - r0);
+                }
+                bk += rb1 - rb0;
+            }
+            return;
+        }
+    }
+    const int per = fast_mode_ == 5 ? FF : H;
+    const int64_t g0 = mrows_ * (int64_t) rank / n_part;
+    const int64_t g1 = mrows_ * (int64_t) (rank + 1) / n_part;
+    for (int64_t r = g0; r < g1;) {
+        const int e = (int) (r / per), r0 = (int) (r % per);
+        const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
+        SplitBufMulti& sb = split_multi_[(size_t) e];
+        const uint8_t* const blob = (worker_node == 1 && mjobs_[e].blob_n1 != nullptr) ? mjobs_[e].blob_n1 : mjobs_[e].blob;
+        if (fast_mode_ == 5 && nfmt_->gu_type == 42 && q2_simd) {
+            thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+            float* gp[MAXT];
+            float* up[MAXT];
+            for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+            const int nbk = (int) (nfmt_->n_embd / 64);
+            q2_rows_any(blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
+            q2_rows_any(blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
+            for (int t = 0; t < mjobs_[e].nt; ++t)
+                for (int rr = r0; rr < r1; ++rr)
+                    sb.ff[t][rr] = (gbuf[t][rr] / (1.f + std::exp(-gbuf[t][rr]))) * ubuf[t][rr];
+        } else if (fast_mode_ == 5) {
+            float* ff[MAXT];
+            for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+            native_gu_rows(*nfmt_, blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+        } else if (nfmt_->d_type == 42 && q2_simd) {
+            const ActQ* a2[MAXT];
+            for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
+            q2_rows_any(blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
+                        mjobs_[e].nt, mjobs_[e].out, r0, r1);
+        } else {
+            const void* hq[MAXT];
+            for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+            native_down_rows(*nfmt_, blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+        }
+        r += r1 - r0;
+    }
+}
+
+void ExpertPool::run_fast_phase(int mode, int target_node) {
+    fast_mode_ = mode;
+    if (target_node >= 0 && n_numa_nodes_ == 2) {
+        fast_use_numa_ = true;
+        const bool host_in = (target_node == 0) && host_works_;
+        const auto& ws = node_workers_[target_node];
+        fast_n_part_ = (int) ws.size() + (host_in ? 1 : 0);
+        const uint32_t e = fast_epoch_[target_node].val.fetch_add(1, std::memory_order_seq_cst) + 1;
+        if (sleepers_.load(std::memory_order_seq_cst) != 0) {
+            std::lock_guard<std::mutex> lk(sleep_mu_);
+            sleep_cv_.notify_all();
+        }
+        if (host_in) run_fast_slice(0, fast_n_part_);
+        for (int id : ws) {
+            while (wdone_[(size_t) id].val.load(std::memory_order_acquire) != e) strata_cpu_pause();
+        }
+    } else {
+        fast_use_numa_ = false;
+        fast_n_part_ = n_ + (host_works_ ? 1 : 0);
+        const uint32_t e0 = !node_workers_[0].empty()
+            ? fast_epoch_[0].val.fetch_add(1, std::memory_order_seq_cst) + 1 : 0;
+        const uint32_t e1 = !node_workers_[1].empty()
+            ? fast_epoch_[1].val.fetch_add(1, std::memory_order_seq_cst) + 1 : 0;
+        if (sleepers_.load(std::memory_order_seq_cst) != 0) {
+            std::lock_guard<std::mutex> lk(sleep_mu_);
+            sleep_cv_.notify_all();
+        }
+        if (host_works_) run_fast_slice(0, fast_n_part_);
+        for (int id : node_workers_[0]) {
+            while (wdone_[(size_t) id].val.load(std::memory_order_acquire) != e0) strata_cpu_pause();
+        }
+        for (int id : node_workers_[1]) {
+            while (wdone_[(size_t) id].val.load(std::memory_order_acquire) != e1) strata_cpu_pause();
+        }
     }
 }
 
@@ -363,7 +524,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5 && nfmt_->gu_type == 42 && q2_own_kernels()) {
+                // Own Q2_0 row kernels need AVX2/AVX-512; pre-AVX2 x86 falls through to ggml-cpu.
+                const bool q2_simd = q2_own_kernels() && (cpu_avx2_ok() || cpu_avx512_ok());
+                if (mode_ == 5 && nfmt_->gu_type == 42 && q2_simd) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
                     float* gp[MAXT];
@@ -379,7 +542,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
                     native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                } else if (nfmt_->d_type == 42 && q2_own_kernels()) {
+                } else if (nfmt_->d_type == 42 && q2_simd) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
@@ -483,31 +646,114 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
+void ExpertPool::quant_acts_native(const NativeFmt& f, const float* x_f, int64_t H_dim, uint32_t tok_mask,
+                                   int n_tok, uint8_t* dst_base, size_t stride_bytes) {
+    int nq = 0;
+    for (int t = 0; t < n_tok && t < MAXT; ++t) {
+        if (tok_mask & (1u << (unsigned) t)) actq_toks_[nq++] = t;
+    }
+    if (nq <= 0) return;
+    static const bool use_fast = [] {
+        const char* v = std::getenv("MAYA_POOL_FAST");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (nq == 1 || !use_fast) {
+        for (int i = 0; i < nq; ++i) {
+            const int t = actq_toks_[i];
+            native_quant_act(f, x_f + (size_t) t * (size_t) H_dim, dst_base + (size_t) t * stride_bytes);
+        }
+        return;
+    }
+    nfmt_ = &f;
+    actq_x_ = x_f;
+    actq_H_ = H_dim;
+    actq_dst_ = dst_base;
+    actq_stride_ = stride_bytes;
+    actq_n_ = nq;
+    // Wake BOTH sockets together so Socket 1 pre-warms out of C6 sleep in parallel with Socket 0 quant!
+    run_fast_phase(8, -1);
+}
+
+void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, int layer_hint) {
     if (n <= 0) return;
+    static const bool use_fast = [] {
+        const char* v = std::getenv("MAYA_POOL_FAST");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    static const bool numa_local = [] {
+        const char* v = std::getenv("MAYA_POOL_NUMA_LOCAL");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    static const int numa_split_l = [] {
+        const char* v = std::getenv("MAYA_NUMA_SPLIT_LAYER");
+        return v ? std::atoi(v) : 24;
+    }();
+    const int target_node = (numa_local && n_numa_nodes_ == 2 && layer_hint >= 0)
+                            ? (layer_hint >= numa_split_l ? 1 : 0) : -1;
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
-        const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = 3 * threads;
-        mrows_ = (int64_t) nb * FF;
-        const auto a = std::chrono::steady_clock::now();
-        run_phase(5, mtasks_);
-        const auto b = std::chrono::steady_clock::now();
-        for (int e = 0; e < nb; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (f.d_type == 42 && q2_own_kernels()) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
-        const auto c = std::chrono::steady_clock::now();
-        mrows_ = (int64_t) nb * H;
-        run_phase(6, mtasks_);
-        const auto d = std::chrono::steady_clock::now();
-        ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
-        ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
-        ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+        fast_nb_ = nb;
+        if (use_fast) {
+            const bool q2_simd = q2_own_kernels() && (cpu_avx2_ok() || cpu_avx512_ok());
+            int qk = 0;
+            size_t qts = 0;
+            native_quant_h_info(f, qk, qts);
+            int total_q = 0;
+            for (int e = 0; e < nb; ++e) total_q += mjobs_[e].nt;
+            const bool fused_q = (nb >= 2 && total_q >= 3) &&
+                                 !(f.gu_type == 42 && q2_simd) && !(f.d_type == 42 && q2_simd) &&
+                                 qk > 0 && qk <= 64 && (FF % qk) == 0;
+            mrows_ = (int64_t) nb * FF;
+            const auto a = std::chrono::steady_clock::now();
+            run_fast_phase(5, target_node);
+            const auto b = std::chrono::steady_clock::now();
+            if (!fused_q) {
+                if (total_q >= 3) {
+                    run_fast_phase(7, target_node);
+                } else {
+                    const bool q2_d = (f.d_type == 42) && q2_simd;
+                    for (int e = 0; e < nb; ++e)
+                        for (int t = 0; t < mjobs_[e].nt; ++t)
+                            if (q2_d) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                            else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+                }
+            }
+            const auto c = std::chrono::steady_clock::now();
+            mrows_ = (int64_t) nb * H;
+            run_fast_phase(6, target_node);
+            const auto d = std::chrono::steady_clock::now();
+            ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
+            ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
+            ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+        } else {
+            const int threads = n_ + (host_works_ ? 1 : 0);
+            static const int task_mult = [] {
+                const char* v = std::getenv("MAYA_POOL_TASKS_MULT");
+                return v ? std::max(1, std::min(4, std::atoi(v))) : 3;
+            }();
+            mrows_ = (int64_t) nb * FF;
+            mtasks_ = std::max(1, std::min<int>((int) ((mrows_ + 15) / 16), task_mult * threads));
+            const auto a = std::chrono::steady_clock::now();
+            run_phase(5, mtasks_);
+            const auto b = std::chrono::steady_clock::now();
+            for (int e = 0; e < nb; ++e)
+                for (int t = 0; t < mjobs_[e].nt; ++t)
+                    if (f.d_type == 42 && q2_own_kernels() && (cpu_avx2_ok() || cpu_avx512_ok()))
+                        act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                    else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+            const auto c = std::chrono::steady_clock::now();
+            mrows_ = (int64_t) nb * H;
+            mtasks_ = std::max(1, std::min<int>((int) ((mrows_ + 15) / 16), task_mult * threads));
+            run_phase(6, mtasks_);
+            const auto d = std::chrono::steady_clock::now();
+            ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
+            ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
+            ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+        }
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
     mode_ = 0;

@@ -67,7 +67,10 @@ public:
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
     void kv_restore(int64_t upto);
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
-    bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
+    /// When `head` is TP-sharded (`head->n_out() < n_vocab`), pass `head_gguf` (the GGUF shard holding output.weight)
+    /// so the draft head gathers its 16K draft_vocab rows directly from the GGUF.
+    bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
+              const std::string& head_gguf = std::string());
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.
@@ -91,6 +94,7 @@ public:
     const float* tensor_f32(const char* name) const { return f32(name); }
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
+    int q8_type() const { return q8_type_; }
     QsaState& kv_state_rw() { return st_; }
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
@@ -100,7 +104,7 @@ public:
     }
 
 private:
-    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
+    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err, bool skip_prefix = false);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, std::string& err);
@@ -129,7 +133,11 @@ private:
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;
+    int q8_type_ = 8;
+    bool experts_soa_ = false;
     uint8_t* dense_ = nullptr;
+    uint8_t* hc_q8_soa_ = nullptr;   ///< GP100 Q8_0_SOA repacked copies of the 6 MTP hyper-connection matrices (20.9 MiB)
+    const void* hc_q8_ptr_[6] = {};  ///< [0,1]=attn dn/up, [2,3]=mlp dn/up, [4,5]=mixer dn/up
     uint8_t* experts_ = nullptr;
     uint64_t experts_bytes_ = 0;
     bool want_lend_ = false;
@@ -144,6 +152,7 @@ private:
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
+    uint32_t *h_done_ = nullptr, *m_done_ = nullptr;   // mapped host completion flag (eliminates cudaStreamSynchronize!)
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;

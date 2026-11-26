@@ -5,6 +5,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cfloat>
 #include <cmath>
 
 #include <cstdio>
@@ -672,12 +673,213 @@ bool launch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const
     return true;
 }
 
+// ============================================================================
+// GP100 Pascal (sm_60) Single-Launch FlashAttention for INT8 KV (QSA Prefill)
+// Replaces 64-128 serial qsa_decode_attn_batch + attn_merge launches and ~38 GB
+// of part_acc HBM2 traffic with 1 launch, HFMA2 Q.K, and FP32 online softmax!
+// ============================================================================
+constexpr int P_THREADS = 256;
+constexpr int P_CH = 64;
+
+__device__ __forceinline__ float p_warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float p_warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ __forceinline__ __half2 p_i8_lo_h2(uint32_t w, __half2 c1152) {
+    const uint32_t x = w ^ 0x80808080u;
+    const uint32_t u = __byte_perm(x, 0x64006400u, 0x5150);
+    return __hsub2(*reinterpret_cast<const __half2*>(&u), c1152);
+}
+__device__ __forceinline__ __half2 p_i8_hi_h2(uint32_t w, __half2 c1152) {
+    const uint32_t x = w ^ 0x80808080u;
+    const uint32_t u = __byte_perm(x, 0x64006400u, 0x7372);
+    return __hsub2(*reinterpret_cast<const __half2*>(&u), c1152);
+}
+
+template <int PG>
+__global__ void __launch_bounds__(P_THREADS, 4) prompt_attn_pascal_i8_kernel(
+    const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids,
+    const int32_t* __restrict__ steps, int n_kv_heads, int page_size, float scale,
+    float* __restrict__ attn, int cap) {
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * PG;
+    q += (size_t) qi * n_head * HD + (size_t) kvh * PG * HD;
+    attn += (size_t) qi * n_head * HD + (size_t) kvh * PG * HD;
+    ids += (size_t) qi * cap;
+    const int n_ids = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    if (n_ids <= 0) {
+#pragma unroll
+        for (int h = 0; h < PG; ++h) attn[(size_t) h * HD + t] = 0.0f;
+        return;
+    }
+
+    __shared__ __align__(16) __half2 sq[PG][HD / 2];   // 6144 B (G=12) / 3072 B (G=6)
+    __shared__ __align__(16) float sp[PG][P_CH];       // 3072 B / 1536 B
+    __shared__ __align__(16) __half2 sph[PG][P_CH / 2];// 1536 B / 768 B
+    __shared__ float svsc[P_CH][HD / KV_Q8_GROUP];    // 1024 B
+    __shared__ long long srow[P_CH];                  // 512 B
+    __shared__ float qmax_s[8];
+    __shared__ float mrow[PG], lsum[PG], salpha[PG];
+
+    // Power-of-two Q prescale so |q * qup| <= 8 -> 8-elem lane dot <= 8192 (zero FP16 overflow!)
+    float qm = 0.0f;
+    for (int i = t; i < PG * HD; i += P_THREADS) qm = fmaxf(qm, fabsf(__ldg(q + i)));
+    qm = p_warp_max(qm);
+    if (lane == 0) qmax_s[warp] = qm;
+    if (t < PG) { mrow[t] = -FLT_MAX; lsum[t] = 0.0f; salpha[t] = 0.0f; }
+    __syncthreads();
+    if (warp == 0) {
+        float bm = (lane < 8) ? qmax_s[lane] : 0.0f;
+        bm = p_warp_max(bm);
+        if (lane == 0) qmax_s[0] = bm;
+    }
+    __syncthreads();
+    qm = qmax_s[0];
+    int qe = 0;
+    if (qm > 0.0f) frexpf(qm, &qe);
+    const float qup = (qm > 0.0f) ? ldexpf(1.0f, 3 - qe) : 1.0f;
+    const float qdown = (qm > 0.0f) ? ldexpf(scale, qe - 3) : scale;
+
+    for (int i = t; i < PG * (HD / 2); i += P_THREADS) {
+        const float2 v = __ldg(reinterpret_cast<const float2*>(q) + i);
+        sq[i >> 7][i & 127] = __floats2half2_rn(v.x * qup, v.y * qup);
+    }
+    __syncthreads();
+
+    float acc[PG];
+#pragma unroll
+    for (int h = 0; h < PG; ++h) acc[h] = 0.0f;
+
+    const __half2 c1152 = __floats2half2_rn(1152.0f, 1152.0f);
+    const int k_grp = lane >> 3;        // 0..3 (8 lanes x 8 dims = 64 = KV_Q8_GROUP)
+    const int v_grp = t >> 6;           // 0..3 (dim t / 64)
+
+    for (int c0 = 0; c0 < n_ids; c0 += P_CH) {
+        const int n_here = min(P_CH, n_ids - c0);
+        if (t < P_CH) {
+            long long r = -1;
+            if (t < n_here) {
+                const int cell = __ldg(ids + c0 + t);
+                const long long page = (long long) __ldg(p.page_table + cell / page_size);
+                r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+            }
+            srow[t] = r;
+        }
+        __syncthreads();
+
+        // Preload V scales (64 cells x 4 groups = 256 threads, 1 load per thread!)
+        {
+            const int c = t >> 2, g = t & 3;
+            const long long r = srow[c];
+            svsc[c][g] = (r >= 0) ? __half2float(__ushort_as_half(__ldg(p.v_scale + r * 4 + g))) : 0.0f;
+        }
+
+        // Q.K via HFMA2: 8 warps handle 8 cells each; each lane holds 8 dims (100% coalesced 256B K load)
+        for (int c = warp; c < n_here; c += 8) {
+            const long long r = srow[c];
+            const uint2 raw = __ldg(reinterpret_cast<const uint2*>(p.k_q + r * HD + lane * 8));
+            const float ksc = __half2float(__ushort_as_half(__ldg(p.k_scale + r * 4 + k_grp))) * qdown;
+            const __half2 k0 = p_i8_lo_h2(raw.x, c1152);
+            const __half2 k1 = p_i8_hi_h2(raw.x, c1152);
+            const __half2 k2 = p_i8_lo_h2(raw.y, c1152);
+            const __half2 k3 = p_i8_hi_h2(raw.y, c1152);
+#pragma unroll
+            for (int h = 0; h < PG; ++h) {
+                const uint4 qv = *reinterpret_cast<const uint4*>(&sq[h][lane * 4]);
+                __half2 dh = __hmul2(k0, *reinterpret_cast<const __half2*>(&qv.x));
+                dh = __hfma2(k1, *reinterpret_cast<const __half2*>(&qv.y), dh);
+                dh = __hfma2(k2, *reinterpret_cast<const __half2*>(&qv.z), dh);
+                dh = __hfma2(k3, *reinterpret_cast<const __half2*>(&qv.w), dh);
+                const float2 f = __half22float2(dh);
+                float s = p_warp_sum((f.x + f.y) * ksc);
+                if (lane == 0) sp[h][c] = s;
+            }
+        }
+        __syncthreads();
+
+        // Online softmax across 64 cells (each lane owns cells 2*lane and 2*lane+1 -> packs directly into sph!)
+        for (int h = warp; h < PG; h += 8) {
+            const int c_lo = lane * 2, c_hi = lane * 2 + 1;
+            const float va = (c_lo < n_here) ? sp[h][c_lo] : -FLT_MAX;
+            const float vb = (c_hi < n_here) ? sp[h][c_hi] : -FLT_MAX;
+            const float cm = p_warp_max(fmaxf(va, vb));
+            const float m_old = mrow[h];
+            const float m_new = fmaxf(m_old, cm);
+            const float alpha = (m_old == -FLT_MAX) ? 0.0f : __expf(m_old - m_new);
+            const float ea = (c_lo < n_here) ? __expf(va - m_new) : 0.0f;
+            const float eb = (c_hi < n_here) ? __expf(vb - m_new) : 0.0f;
+            sph[h][lane] = __floats2half2_rn(ea, eb);
+            const float cl = p_warp_sum(ea + eb);
+            if (lane == 0) {
+                salpha[h] = alpha;
+                mrow[h] = m_new;
+                lsum[h] = fmaf(lsum[h], alpha, cl);
+            }
+        }
+        __syncthreads();
+
+        // P.V via HFMA2 (2 cells per step -> 2x FMA throughput!), flushed to FP32 acc every chunk!
+        __half2 ah[PG];
+#pragma unroll
+        for (int h = 0; h < PG; ++h) {
+            acc[h] *= salpha[h];
+            ah[h] = __float2half2_rn(0.0f);
+        }
+        const int n_pairs = (n_here + 1) >> 1;
+        for (int cp = 0; cp < n_pairs; ++cp) {
+            const int c_lo = cp * 2, c_hi = cp * 2 + 1;
+            const float v0 = (float) __ldg(p.v_q + srow[c_lo] * HD + t) * svsc[c_lo][v_grp];
+            const float v1 = (c_hi < n_here) ? ((float) __ldg(p.v_q + srow[c_hi] * HD + t) * svsc[c_hi][v_grp]) : 0.0f;
+            const __half2 vh = __floats2half2_rn(v0, v1);
+#pragma unroll
+            for (int h = 0; h < PG; ++h) ah[h] = __hfma2(sph[h][cp], vh, ah[h]);
+        }
+#pragma unroll
+        for (int h = 0; h < PG; ++h) {
+            const float2 f = __half22float2(ah[h]);
+            acc[h] += f.x + f.y;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int h = 0; h < PG; ++h) {
+        const float inv_l = lsum[h] > 0.0f ? (1.0f / lsum[h]) : 0.0f;
+        attn[(size_t) h * HD + t] = acc[h] * inv_l;
+    }
+}
+
+template <int PG>
+bool launch_pascal_i8(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                      const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+    const float scale = 1.0f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        prompt_attn_pascal_i8_kernel<PG><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), P_THREADS, 0, st>>>(
+            q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv,
+            (int) s.page_size, scale, attn + q0 * s.n_head * HD, (int) cap);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch pascal: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
+
 }  // namespace
 
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return true;
-    {   // sm_80 or newer (the MMA and cp.async above); an older card keeps the old kernel
+    {   // sm_80 or newer uses MMA+cp.async; Pascal/Volta/Turing (sm_60..75) uses our single-launch HFMA2 FlashAttention!
         static int cc_major[64] = {};
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
@@ -689,7 +891,18 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             }
             cc_major[dev] = major;
         }
-        if (cc_major[dev] < 8) return false;
+        if (cc_major[dev] < 8) {
+#if !defined(__HIPCC__)
+            const int pg = (s.n_head_kv > 0 && s.n_head % s.n_head_kv == 0) ? (int) (s.n_head / s.n_head_kv) : 0;
+            if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
+                pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD &&
+                (pg == 12 || pg == 6) && cap > 0 && ids && steps && pools.page_table) {
+                if (pg == 6) return launch_pascal_i8<6>(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+                return launch_pascal_i8<12>(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+            }
+#endif
+            return false;
+        }
     }
 #if defined(__HIPCC__)
     return false;   // the tensor-core kernel is compiled out on AMD (its major version is not a CUDA sm)

@@ -759,7 +759,7 @@ QWEN_MODEL_NAME = "cyber-frost-3.8-ps"
 QWEN_SAMPLING, QWEN_EFFORT = Q.MODEL_DEFAULTS["qwen"]   # (its card's; its template's default level: Qwen's "xhigh")
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]     # (the model's native reach: 256K)
 QWEN_DEFAULT_CONTEXT = 65536
-QWEN_MIN_CC = 70                                   # (V100 on: the Qwen path's kernels are validated from Volta)
+QWEN_MIN_CC = 60                                   # Pascal (sm_60 P100 / sm_61 P40) and newer supported
 QWEN_PROFILE = ROOT / "data" / "expert-profile-qwen.bin"
 # KV bytes a context token: 12 attention layers x K and V (2 heads x 256) in INT8 with an FP16 scale a 64 values, and the
 # indexer's pooled keys.  INT8 is the setup's KV format (--kv int8: the model card's own llama.cpp line runs q8_0 K / V;

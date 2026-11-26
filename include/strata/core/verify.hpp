@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+// (pipe crew: thread/mutex live in the .cpp)
 
 namespace strata::core {
 
@@ -48,6 +49,7 @@ struct VerifyHits {
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
+    bool cache_soa = false;               ///< GP100 K-Major SoA expert cache layout
 };
 
 class Verifier {
@@ -104,11 +106,24 @@ public:
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
+    /// LAYER SPLIT PIPE (MAYA_VERIFY_PIPE): when set on the chain head, `run` of T>=2 tokens drives the stages as a
+    /// token pipeline (GLM win_pipe shape).  Warp pipe: T=1 graphs + per-token GDN advance + snapshot/restore so
+    /// in-window recurrence stays correct; final `commit(n_keep)` still decides acceptance.  Set before first `run`.
+    void set_pipe(bool on) { pipe_ = on; if (next_) next_->set_pipe(on); }
+    /// True when this stage holds 100% of its layers' experts in VRAM -> zero-doorbell/zero-PCIe exec_fast_!
+    void set_all_resident(bool on) { all_resident_ = on; }
+    /// Rebind this stage's hand-off pointers (pipe double-buffers).  `in`/`out` must stay alive across the window.
+    void bind_handoff(const float* in, float* out) { hand_in_ = in; hand_out_ = out; }
+    /// Crew thread: launch/sync on a stream created on THIS thread (Pascal: syncing the init thread's cs_ hangs).
+    void set_pipe_stream(cudaStream_t s) { pipe_cs_ = s; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// Async multi-GPU commit: launches all stages' commits concurrently without syncing; pair with commit_wait().
+    bool commit_begin(int n_keep, std::string& err);
+    bool commit_wait(std::string& err);
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
@@ -128,7 +143,8 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
-    /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
+    /// the pool never plans a PCIe share (--pcie-frac 0): the window skips waitB + empty PCIe grouped kernels.
+    void set_skip_pcie(bool on) { skip_pcie_ = on; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
@@ -138,6 +154,37 @@ public:
 
 private:
     bool capture(int T, std::string& err);
+    bool capture_fast(int T, std::string& err);
+    bool restore_for_miss_rerun(std::string& err);
+    /// Token-pipelined multi-GPU window (set_pipe): see set_pipe.
+    bool run_pipe_window(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                         std::string& err);
+    /// One stage, one token in window slot `slot` (GLM pipe_t).  Captures/launches exec_pipe_[slot] so commit inputs
+    /// and hand-offs land on row `slot` directly (no scatter).  `pipe_cont` skips re-snapshotting the indexer tail.
+    bool run_stage_token(int32_t token, int64_t pos, int slot, bool pipe_cont, PoolMultiFn pool, void* user,
+                         int32_t* out_one, std::string& err);
+    /// Shepherd (PIPE=1): launch T=1 into `slot` without waiting.  Pair with pipe_token_poll / pipe_advance_*.
+    bool pipe_token_begin(int32_t token, int64_t pos, int slot, bool pipe_cont, PoolMultiFn pool, void* user,
+                          std::string& err);
+    /// Non-blocking doorbell step.  -1 error, 0 still running, 1 verify graph finished (handoff+out ready).
+    int pipe_token_poll(int32_t* out_one, std::string& err);
+    /// Legacy: copy slot-0 commit inputs into slot `t`.  Unused once exec_pipe_[t] writes rows directly.
+    bool scatter_commit_slot(int t, std::string& err);
+    bool capture_pipe_slot(int slot, std::string& err);
+    bool capture_pipe_fast_slot(int slot, std::string& err);
+    bool capture_pipe_advance_slot(int slot, std::string& err);
+    /// Warp pipe: snapshot this stage's GDN (+conv) before the window; restore before the real `commit`.
+    bool pipe_snap_gdn(std::string& err);
+    /// Non-blocking: -1 error, 0 still copying, 1 snap ready (shepherd may begin tokens).
+    int pipe_snap_poll(std::string& err);
+    bool pipe_restore_gdn(std::string& err);
+    bool pipe_restore_sync(std::string& err);
+    /// After T=1 verify into `slot`, advance GDN/conv from that slot's commit inputs.
+    bool pipe_advance_gdn(int64_t pos, int slot, std::string& err);
+    /// Async GDN advance for the shepherd (no host sync); pair with pipe_advance_poll.
+    bool pipe_advance_begin(int64_t pos, int slot, std::string& err);
+    /// -1 error, 0 still running, 1 advance finished.
+    int pipe_advance_poll(std::string& err);
     strata::kernels::SamplerParams sampling_ = [] {
         strata::kernels::SamplerParams s;
         s.greedy = true;
@@ -149,6 +196,7 @@ private:
     bool head_sampling_ = true;          ///< set_head_sampling
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (MAYA_VERIFY_DEVICE_PLAN)
+    bool skip_pcie_ = false;              ///< --pcie-frac 0: omit waitB and empty PCIe grouped kernels from CUDA graph
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
@@ -156,6 +204,43 @@ private:
     float* hand_out_ = nullptr;
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
+    bool pipe_ = false;                  ///< set_pipe: token pipeline across next_
+    bool pipe_cont_ = false;             ///< mid-pipe token: keep the first token's indexer tail snapshot
+    bool pipe_dma_ = false;              ///< this window queued work on copy_ (skip sync when false)
+    int pipe_slot_ = -1;                 ///< >=0: record/run T=1 into window row pipe_slot_ (exec_pipe_[slot])
+    cudaStream_t pipe_cs_ = nullptr;     ///< crew-thread local launch stream (avoids Pascal cross-thread sync hang)
+    cudaGraphExec_t exec_pipe_[8] = {};  ///< T=1 captures per window slot (kVerifyMaxT)
+    cudaGraphExec_t exec_pipe_fast_[8] = {}; ///< T=1 resident-only captures (no doorbell/PCIe/copy/hit_add)
+    cudaGraphExec_t exec_adv_[8] = {};   ///< captured per-slot GDN advance graphs (1 launch vs 18 eager launches)
+    bool fast_res_ = false;              ///< true while capturing exec_fast_ / exec_pipe_fast_
+    bool all_resident_ = false;          ///< true when 100% of this stage's experts fit in VRAM
+    bool pipe_using_fast_ = false;       ///< active pipe token launched exec_pipe_fast_
+    int pipe_active_slot_ = -1;
+    int32_t pipe_active_tok_ = 0;
+    bool pipe_active_cont_ = false;
+    /// Pipe-owned double-buffered hand-offs (host mapped); empty when pipe is off or this is not the chain head.
+    std::vector<float*> pipe_hand_host_;
+    std::vector<float*> pipe_hand_dev_;
+    float* pipe_gdn_snap_ = nullptr;     ///< device snapshot of this stage's GDN slice (warp pipe)
+    size_t pipe_gdn_bytes_ = 0;
+    int64_t pipe_gdn_off_ = 0;           ///< byte offset into ss_->gdn_state for this stage's first GDN layer
+    /// Shepherd poll state (one in-flight T=1 verify per stage).
+    PoolMultiFn pipe_pool_ = nullptr;
+    void* pipe_pool_user_ = nullptr;
+    int64_t pipe_poll_k_ = 0;            ///< doorbell index into (le_-lb_)*G
+    uint32_t pipe_served_misses_ = 0;    ///< misses served in device_plan_ zero-host mode
+    uint32_t pipe_poll_spins_ = 0;       ///< spin counter for throttled watchdog cudaStreamQuery
+    int pipe_poll_T_ = 1;
+    int64_t pipe_poll_pos0_ = 0;
+    bool pipe_poll_active_ = false;
+    bool commit_pending_ = false;        ///< commit_begin launched commit_exec_ on cs_; commit_wait syncs it
+    cudaEvent_t pipe_adv_ev_ = nullptr;  ///< recorded after async GDN advance kernels
+    bool pipe_adv_pending_ = false;
+    bool pipe_fused_advance_ = false;    ///< advance enqueued on verify stream in pipe_token_begin
+    cudaEvent_t pipe_snap_ev_ = nullptr; ///< async GDN snapshot done
+    bool pipe_snap_pending_ = false;
+    bool pipe_gdn_dirty_ = false;        ///< live GDN advanced in pipe; commit restores only on partial accept
+    int32_t pipe_ple_tok_[8] = {};       ///< in-window tokens for PLE n-gram walk (shepherd / stage token)
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
@@ -179,6 +264,7 @@ private:
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t exec_[9] = {};
+    cudaGraphExec_t exec_fast_[9] = {};
     cudaGraphExec_t commit_exec_ = nullptr;
 
     // mapped staging (host pointer, device alias)
@@ -235,6 +321,7 @@ private:
     uint16_t* sh_bf16_ = nullptr;
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
+    float* ple_hist_pre_ = nullptr;                           // pre-window PLE hist snapshot for fast-res miss rerun
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 

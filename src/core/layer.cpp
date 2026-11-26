@@ -1193,7 +1193,11 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
 const char* pre[2] = {"hc_attn_", "hc_ffn_"};    const WeightRef* w_norm[2];    const WeightRef* w_down[2];    const WeightRef* w_up[2];    const WeightRef* w_inject[2];    for (int h = 0; h < 2; ++h) {        const std::string a = std::string(pre[h]) + "norm.weight";        const std::string d = std::string(pre[h]) + "down.weight";        const std::string u = std::string(pre[h]) + "up.weight";        const std::string i = std::string(pre[h]) + "inject.weight";        w_norm[h] = v.get(a.c_str());        w_down[h] = v.get(d.c_str());        w_up[h] = v.get(u.c_str());        w_inject[h] = v.get(i.c_str());        if (!w_norm[h] || !w_down[h] || !w_up[h] || !w_inject[h]) {            err = v.name((std::string(pre[h]) + "{norm,down,up,inject}.weight").c_str()) + " is missing";            return false;        }
 // The GR weights are BF16 and the arena holds them re-rounded to 2 B/elem.  `gr_read` wants exactly
 // that; handing it f32 bytes would walk 2x the tensor inside the arena without faulting.
-if (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf16InF32 ||            w_inject[h]->kind != WeightKind::Bf16InF32 || w_norm[h]->kind != WeightKind::F32) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16)";            return false;        }    }
+const bool ok_d = ((w_down[h]->native_type == 8 || w_down[h]->native_type == 108) && w_down[h]->native_data) ||
+                  w_down[h]->kind == WeightKind::Bf16InF32;
+const bool ok_u = ((w_up[h]->native_type == 8 || w_up[h]->native_type == 108) && w_up[h]->native_data) ||
+                  w_up[h]->kind == WeightKind::Bf16InF32;
+if (!ok_d || !ok_u || w_inject[h]->kind != WeightKind::Bf16InF32 || w_norm[h]->kind != WeightKind::F32) {            err = v.name(pre[h]) + "has the wrong engine forms (norm must be F32, the other three bf16/q8_0)";            return false;        }    }
 // ---- half 1: the mixer
 float* R = bb.R;
     // R0.11: WHICH STAGES TO RUN.  `stage_prefix == 0` means "as `half` says", so every caller that predates
@@ -1209,8 +1213,14 @@ st_begin(layer, 0, stream);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = pending_ffn; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject2;
-        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = (const uint16_t*) w_down[0]->data;
-        fa.w_up = (const uint16_t*) w_up[0]->data; fa.w_inject = (const uint16_t*) w_inject[0]->data;
+        fa.w_norm = (const float*) w_norm[0]->data;
+        fa.w_down = (const uint16_t*) w_down[0]->data;
+        fa.w_up = (const uint16_t*) w_up[0]->data;
+        fa.w_down_q8 = (w_down[0]->native_type == 8 || w_down[0]->native_type == 108) ? w_down[0]->native_data : nullptr;
+        fa.w_up_q8 = (w_up[0]->native_type == 8 || w_up[0]->native_type == 108) ? w_up[0]->native_data : nullptr;
+        fa.w_down_q8_soa = (w_down[0]->native_type == 108);
+        fa.w_up_q8_soa = (w_up[0]->native_type == 108);
+        fa.w_inject = (const uint16_t*) w_inject[0]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
@@ -1232,8 +1242,14 @@ st_begin(layer, 3, stream);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = true; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject;
-        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = (const uint16_t*) w_down[1]->data;
-        fa.w_up = (const uint16_t*) w_up[1]->data; fa.w_inject = (const uint16_t*) w_inject[1]->data;
+        fa.w_norm = (const float*) w_norm[1]->data;
+        fa.w_down = (const uint16_t*) w_down[1]->data;
+        fa.w_up = (const uint16_t*) w_up[1]->data;
+        fa.w_down_q8 = (w_down[1]->native_type == 8 || w_down[1]->native_type == 108) ? w_down[1]->native_data : nullptr;
+        fa.w_up_q8 = (w_up[1]->native_type == 8 || w_up[1]->native_type == 108) ? w_up[1]->native_data : nullptr;
+        fa.w_down_q8_soa = (w_down[1]->native_type == 108);
+        fa.w_up_q8_soa = (w_up[1]->native_type == 108);
+        fa.w_inject = (const uint16_t*) w_inject[1]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {

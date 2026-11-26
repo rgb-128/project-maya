@@ -188,6 +188,33 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t s = v ^ p << 7;
     return s * 0x01010101;
 }
+// Four weights' signs without __vcmpne4 / __vsub4 (about 16 emulated ops each on sm_60): bits 0..3 of x4 negate bytes 0..3
+// of g.  A grid byte is never 0, so (g ^ m) + (m & 1) per byte is the exact two's complement without a carry into the
+// next byte, and (x4 * 0x00204081) & 0x01010101 puts bit j of x4 in byte j.
+__device__ __forceinline__ int sflip4(uint32_t g, uint32_t x4) {
+    const uint32_t m1 = ((x4 & 0xFu) * 0x00204081u) & 0x01010101u;
+    return (int) ((g ^ (m1 * 255u)) + m1);
+}
+// ... the IQ2_XXS / IQ3_XXS sign byte: 7 sign bits and their parity (unpack_ksigns' bits 0..7)
+__device__ __forceinline__ uint32_t ksign8(uint32_t v) {
+    v &= 0xFFu;
+    return v ^ ((__popc(v) & 1u) << 7);
+}
+
+// sm_60: apply 8 sign bits to two grid words without emulated __vcmpne4/__vsub4 (same bytes as unpack_ksigns path).
+__device__ __forceinline__ void sign_pair(uint32_t gx, uint32_t gy, uint32_t ksigns7, int& o0, int& o1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+    const uint32_t sb = ksign8(ksigns7);
+    o0 = sflip4(gx, sb);
+    o1 = sflip4(gy, sb >> 4);
+#else
+    const uint32_t signs = unpack_ksigns(ksigns7);
+    const int signs0 = __vcmpne4(signs & 0x08040201, 0);
+    const int signs1 = __vcmpne4(signs & 0x80402010, 0);
+    o0 = (int) __vsub4(gx ^ signs0, signs0);
+    o1 = (int) __vsub4(gy ^ signs1, signs1);
+#endif
+}
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
     const uint32_t* table32 = (const uint32_t*) table;
     uint32_t tmp[2];
@@ -542,13 +569,10 @@ __device__ __forceinline__ float dot_iq2_xxs(const void* vbq, const block_q8_1* 
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[aux8[k0 / 2]];
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        int grid0, grid1;
+        sign_pair(grid_pos.x, grid_pos.y, aux32 >> (7 * k0 / 2), grid0, grid1);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
         sumi = __dp4a(grid0, u0, sumi);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
         sumi = __dp4a(grid1, u1, sumi);
     }
@@ -566,12 +590,9 @@ __device__ __forceinline__ float dot_iq3_xxs(const void* vbq, const block_q8_1* 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        int grid_l, grid_h;
+        sign_pair(grid_pos.x, grid_pos.y, aux32 >> (7 * l0 / 2), grid_l, grid_h);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         sumi = __dp4a(grid_l, u0, sumi);
         sumi = __dp4a(grid_h, u1, sumi);
@@ -707,6 +728,16 @@ __device__ __forceinline__ float dot_iq1_s_t(const void* vbq, const block_q8_1* 
     const float2 ds = __half22float2(bq8_1[iqs].ds);
     return d1q * (ds.x * sumi + ds.y * delta);
 }
+// GP100 (sm_60) 32-bit Bank-Split SoA lookup: replaces AoS uint2 LDS.64 (2x shared-memory bank conflicts on Pascal)
+// with 2x LDS.32 from split low/high halves [0..H) and [H..2H), 100% bit-identical!
+template<int H>
+__device__ __forceinline__ uint2 sm60_tab_u2(const uint32_t* tab, uint32_t idx) {
+#if GLMF_SM60
+    return make_uint2(tab[idx], tab[idx + H]);
+#else
+    return ((const uint2*) tab)[idx];
+#endif
+}
 __device__ __forceinline__ float dot_iq2_xxs_t(const void* vbq, const block_q8_1* bq8_1, const int& kbx,
                                                const int& iqs, const uint32_t* tab) {
     const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
@@ -716,14 +747,11 @@ __device__ __forceinline__ float dot_iq2_xxs_t(const void* vbq, const block_q8_1
     int sumi = 0;
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
-        const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        const uint2 grid_pos = sm60_tab_u2<256>(tab, aux8[k0 / 2]);
+        int grid0, grid1;
+        sign_pair(grid_pos.x, grid_pos.y, aux32 >> (7 * k0 / 2), grid0, grid1);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
         sumi = __dp4a(grid0, u0, sumi);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
         sumi = __dp4a(grid1, u1, sumi);
     }
@@ -742,12 +770,9 @@ __device__ __forceinline__ float dot_iq3_xxs_t(const void* vbq, const block_q8_1
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
-        const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        int grid_l, grid_h;
+        sign_pair(grid_pos.x, grid_pos.y, aux32 >> (7 * l0 / 2), grid_l, grid_h);
         const int u0 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 0);
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs / 2].qs, l0 + 1);
         sumi = __dp4a(grid_l, u0, sumi);
         sumi = __dp4a(grid_h, u1, sumi);
@@ -780,6 +805,18 @@ __device__ __forceinline__ void load_tab(uint32_t* s_tab) {
                           : T == 17 ? (const uint32_t*) iq2xs_grid
                           : T == 22 ? (const uint32_t*) iq2s_grid
                           : T == 21 ? (const uint32_t*) iq3s_grid : nullptr;
+#if GLMF_SM60
+    if constexpr (T == 16 || T == 17 || T == 22) {
+        constexpr int H = TabWords<T>::n / 2;
+        const uint2* src2 = (const uint2*) src;
+        for (int i = threadIdx.x; i < H; i += blockDim.x) {
+            const uint2 gp = __ldg(src2 + i);
+            s_tab[i] = gp.x;
+            s_tab[i + H] = gp.y;
+        }
+        return;
+    }
+#endif
     for (int i = threadIdx.x; i < TabWords<T>::n; i += blockDim.x) s_tab[i] = src[i];
 }
 // ---- the activation half of a dot, loaded ONCE and reused across rows: every i-quant call k reads exactly one
@@ -834,11 +871,15 @@ template<> __device__ __forceinline__ float dw<16>(const uint8_t* row, int kbx, 
     int sumi = 0;
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
-        const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
+        const uint2 grid_pos = sm60_tab_u2<256>(tab, aux8[k0 / 2]);
 #if defined(STRATA_USE_HIP)
         const uint4 sgn = hip_fast_signs(aux32 >> (7 * k0 / 2), true);
         sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[k0 + 0], sumi);
         sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[k0 + 1], sumi);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+        const uint32_t sb = ksign8(aux32 >> (7 * k0 / 2));
+        sumi = __dp4a(sflip4(grid_pos.x, sb), x.u[k0 + 0], sumi);
+        sumi = __dp4a(sflip4(grid_pos.y, sb >> 4), x.u[k0 + 1], sumi);
 #else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -864,6 +905,10 @@ template<> __device__ __forceinline__ float dw<18>(const uint8_t* row, int kbx, 
         const uint4 sgn = hip_fast_signs(aux32 >> (7 * l0 / 2), true);
         sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[l0 + 0], sumi);
         sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[l0 + 1], sumi);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+        const uint32_t sb = ksign8(aux32 >> (7 * l0 / 2));
+        sumi = __dp4a(sflip4(grid_pos.x, sb), x.u[l0 + 0], sumi);
+        sumi = __dp4a(sflip4(grid_pos.y, sb >> 4), x.u[l0 + 1], sumi);
 #else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
@@ -901,7 +946,7 @@ template<> __device__ __forceinline__ float dw<17>(const uint8_t* row, int kbx, 
     int sumi0 = 0, sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const uint2 grid_pos = ((const uint2*) tab)[q2[l0 / 2] & 0x1FF];
+        const uint2 grid_pos = sm60_tab_u2<512>(tab, q2[l0 / 2] & 0x1FF);
 #if defined(STRATA_USE_HIP)
         const uint4 sgn = hip_fast_signs(q2[l0 / 2] >> 9, true);
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
@@ -936,11 +981,14 @@ template<> __device__ __forceinline__ float dw<22>(const uint8_t* row, int kbx, 
     int sumi0 = 0, sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const uint2 grid_pos = ((const uint2*) tab)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
+        const uint2 grid_pos = sm60_tab_u2<1024>(tab, qs[l0 / 2] | ((qh << (8 - l0)) & 0x300));
 #if defined(STRATA_USE_HIP)
         const uint4 sgn = hip_fast_signs(signs_packed_8[l0 / 2], false);
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+        const int grid_l = sflip4(grid_pos.x, signs_packed_8[l0 / 2]);
+        const int grid_h = sflip4(grid_pos.y, signs_packed_8[l0 / 2] >> 4);
 #else
         const int signs0 =
             __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
@@ -1025,23 +1073,26 @@ template<> __device__ __forceinline__ float dw<29>(const uint8_t* row, int kbx, 
 // IQ3_S: the sign byte, 256.  On a PH402 die (8 experts, the decode shapes): IQ2_S gate/up 312 -> 273 us, IQ3_XXS
 // down 167 -> 156, IQ3_S down 195 -> 185; IQ2_S keeps the two masks (the +1s by an AND: less shared-memory traffic,
 // faster for it), IQ3_* the masks with their +1s.
-template<int T> constexpr bool sm60_sign_on = GLMF_SM60 && (T == 18 || T == 21 || T == 22);
-template<int T> constexpr int sm60_sign_n = T == 18 ? 128 : 256;
-template<int T> constexpr int sm60_sign_w = T == 22 ? 2 : 4;   // u32 words an entry
+template<int T> constexpr bool sm60_sign_on = GLMF_SM60 && (T == 16 || T == 18 || T == 21 || T == 22);
+template<int T> constexpr int sm60_sign_n = (T == 16 || T == 18) ? 128 : 256;
+// GP100 32-bit Bank-Split SoA sign table: 2 words/entry split [0..N) lo, [N..2N) hi -> 2x LDS.32,
+// eliminates BOTH LDS.128 (4x) and LDS.64 (2x) Pascal shared-memory bank conflicts AND halves smem!
+template<int T> constexpr int sm60_sign_w = 2;
 #if GLMF_SM60
 template<int T>
 __device__ __forceinline__ void sm60_load_signs(uint32_t* t) {
-    for (int i = threadIdx.x; i < sm60_sign_n<T>; i += blockDim.x) {
+    constexpr int N = sm60_sign_n<T>;
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
         unsigned b = i;
-        if constexpr (T == 18) b |= (__popc(b) & 1) << 7;
+        if constexpr (T == 16 || T == 18) b |= (__popc(b) & 1) << 7;
         unsigned lo = 0, hi = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             lo |= (0u - ((b >> j) & 1u)) & (255u << (8 * j));
             hi |= (0u - ((b >> (j + 4)) & 1u)) & (255u << (8 * j));
         }
-        if constexpr (sm60_sign_w<T> == 4) ((uint4*) t)[i] = make_uint4(lo, lo & 0x01010101u, hi, hi & 0x01010101u);
-        else ((uint2*) t)[i] = make_uint2(lo, hi);
+        t[i] = lo;
+        t[i + N] = hi;
     }
 }
 struct Sm60Sign {
@@ -1049,19 +1100,32 @@ struct Sm60Sign {
 };
 template<int T>
 __device__ __forceinline__ Sm60Sign sm60_sign(const uint32_t* t, uint32_t idx) {
-    Sm60Sign r;
-    if constexpr (sm60_sign_w<T> == 4) {
-        const uint4 v = ((const uint4*) t)[idx];
-        r.lm = v.x, r.lp = v.y, r.hm = v.z, r.hp = v.w;
-    } else {
-        const uint2 v = ((const uint2*) t)[idx];
-        r.lm = v.x, r.lp = v.x & 0x01010101u, r.hm = v.y, r.hp = v.y & 0x01010101u;
-    }
-    return r;
+    const uint32_t lm = t[idx];
+    const uint32_t hm = t[idx + sm60_sign_n<T>];
+    return {lm, lm & 0x01010101u, hm, hm & 0x01010101u};
 }
 // dw<T> with the table's signs (st: sm60_load_signs<T>'s table)
 template<int T> __device__ __forceinline__ float dws(const uint8_t* row, int kbx, int iqs, const XV& x,
                                                      const uint32_t* tab, const uint32_t* st);
+
+template<> __device__ __forceinline__ float dws<16>(const uint8_t* row, int kbx, int iqs, const XV& x,
+                                                    const uint32_t* tab, const uint32_t* st) {
+    const block_iq2_xxs* bq2 = (const block_iq2_xxs*) row + kbx;
+    const int q2 = get_int_b2(bq2->qs, iqs);
+    const uint8_t* aux8 = (const uint8_t*) &q2;
+    const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+    int sumi = 0;
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2) {
+        const uint2 grid_pos = sm60_tab_u2<256>(tab, aux8[k0 / 2]);
+        const Sm60Sign sg = sm60_sign<16>(st, (aux32 >> (7 * k0 / 2)) & 127);
+        sumi = __dp4a((int) ((grid_pos.x ^ sg.lm) + sg.lp), x.u[k0 + 0], sumi);
+        sumi = __dp4a((int) ((grid_pos.y ^ sg.hm) + sg.hp), x.u[k0 + 1], sumi);
+    }
+    const int ls = aux32 >> 27 | 1;
+    sumi = sumi * ls / 8;
+    return __half2float(bq2->d) * x.d * sumi;
+}
 template<> __device__ __forceinline__ float dws<18>(const uint8_t* row, int kbx, int iqs, const XV& x,
                                                     const uint32_t* tab, const uint32_t* st) {
     const block_iq3_xxs* bq3 = (const block_iq3_xxs*) row + kbx;
@@ -1093,7 +1157,7 @@ template<> __device__ __forceinline__ float dws<22>(const uint8_t* row, int kbx,
     int sumi0 = 0, sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const uint2 grid_pos = ((const uint2*) tab)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
+        const uint2 grid_pos = sm60_tab_u2<1024>(tab, qs[l0 / 2] | ((qh << (8 - l0)) & 0x300));
         const Sm60Sign sg = sm60_sign<22>(st, signs_packed_8[l0 / 2]);
         const int grid_l = (int) ((grid_pos.x ^ sg.lm) + sg.lp);
         const int grid_h = (int) ((grid_pos.y ^ sg.hm) + sg.hp);
@@ -1544,6 +1608,163 @@ __global__ void __launch_bounds__(256) mv_kernel_t_cols(const STRATA_GRID_CONSTA
             if (c < J.ncol) J.y[c * J.y_cstride + row] = mv_out(J.alpha, s[c], J.bias ? J.bias[row] : 0.0f);
 }
 
+// ---------------------------------------------------------------- Q4_K GEMV without dp4a (Pascal, sm_60)
+// The emulated __dp4a is not what limits the P100's Q4_K GEMV (a free dp4a changes nothing); the per-weight work around
+// it is.  A pair of weights and a pair of activations go through ONE IMAD here: with P = (a0 << 16) + a2 and
+// W = w0 | (w2 << 16) (w a 4-bit value), the high half of P * W is a0 * w0 + a2 * w2 and the low half, a2 * w0, a
+// bounded rest; 8 such IMADs stay under 2^15 in both halves, so (acc + 0x8000) >> 16 is the exact integer dot, the
+// same value dp4a gives.  The activations are staged once a block in shared memory as those pairs (16 B granules,
+// bank-conflict free), with each 32-value sub-block's scale and its exact sum (the min term).  A lane takes 16 weights
+// of two sub-blocks from one 16 B load; the scales of all eight sub-blocks unpack without a branch.  Every column has the
+// same arithmetic as a single column's, so a column is bit for bit the one-column result.
+constexpr int PQ_COLS = 4;
+__host__ __device__ constexpr size_t pq_col_bytes(int n_in) { return (size_t) n_in * 2 + (size_t) n_in / 8 + (size_t) n_in / 4; }
+
+// Stage one 32-value Q8_1 activation sub-block (index i = 0..n_in/32-1) into Pascal IMAD pair format in SMEM.
+__device__ __forceinline__ void pq_stage_sub(const block_q8_1& x, int i, int4* xp, float* d8s, int* sums) {
+    d8s[i] = __low2float(x.ds);
+    const int* qi = (const int*) x.qs;
+    const int bq = i >> 3, sg = (i & 7) >> 1, st = i & 1;
+    int s0 = 0, s1 = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int u = qi[k];
+        const int a0 = (int8_t) u, a1 = (int8_t) (u >> 8), a2 = (int8_t) (u >> 16), a3 = u >> 24;
+        int* dst = (int*) &xp[bq * 32 + (st * 2 + ((k & 3) >> 1)) * 8 + ((k >> 2) * 4 + sg)] + (k & 1) * 2;
+        dst[0] = (a0 << 16) + a2;
+        dst[1] = (a1 << 16) + a3;
+        if (k < 4) s0 += a0 + a1 + a2 + a3; else s1 += a0 + a1 + a2 + a3;
+    }
+    sums[2 * i] = s0;
+    sums[2 * i + 1] = s1;
+}
+
+// One lane's 32-weight Q4_K dot for one super-block using 2-way packed IMAD (no dp4a, 16-byte coalesced loads).
+__device__ __forceinline__ float pq_dot_blk(const uint4* blk, int c8, int g,
+                                            const int (&pA)[8], const int (&pB)[8],
+                                            float dA, float dB, int sumA, int sumB) {
+    const uint4 hd = blk[0];
+    const uint4 q = blk[1 + c8];
+    const uint32_t s0 = hd.y, s1 = hd.z, s2 = hd.w;
+    const uint32_t t0 = s0 & 0x3f3f3f3fu, t2 = s1 & 0x3f3f3f3fu;
+    const uint32_t t1 = (s2 & 0x0f0f0f0fu) | (((s0 >> 6) & 0x03030303u) << 4);
+    const uint32_t t3 = ((s2 >> 4) & 0x0f0f0f0fu) | (((s1 >> 6) & 0x03030303u) << 4);
+    const uint32_t scw = (g >> 1) ? t1 : t0, mnw = (g >> 1) ? t3 : t2;
+    const uint32_t scp = scw >> (16 * (g & 1)), mnp = mnw >> (16 * (g & 1));
+    const int scA = scp & 0xff, scB = (scp >> 8) & 0xff, mA = mnp & 0xff, mB = (mnp >> 8) & 0xff;
+    const float2 dm = __half22float2(*(const __half2*) &hd.x);
+    const uint32_t qa[4] = {q.x, q.y, q.z, q.w};
+    int accA = 0, accB = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        accA = pA[2 * k] * (int) (qa[k] & 0x000f000fu) + accA;
+        accA = pA[2 * k + 1] * (int) ((qa[k] >> 8) & 0x000f000fu) + accA;
+        accB = pB[2 * k] * (int) ((qa[k] >> 4) & 0x000f000fu) + accB;
+        accB = pB[2 * k + 1] * (int) ((qa[k] >> 12) & 0x000f000fu) + accB;
+    }
+    const int HA = (accA + 0x8000) >> 16, HB = (accB + 0x8000) >> 16;
+    return dm.x * (dA * (HA * scA) + dB * (HB * scB)) - dm.y * (dA * (sumA * mA) + dB * (sumB * mB));
+}
+
+template<int NC>
+__global__ void __launch_bounds__(256) mv_q4k_pascal(const STRATA_GRID_CONSTANT MvBatch b) {
+    if (b.skip != nullptr && *b.skip) return;
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    extern __shared__ __align__(16) unsigned char pq_sm[];
+    const int n_in = J.n_in, ncol = J.ncol, nb = n_in / 256, nsub = n_in / 32;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int row = (bid - blk0) * MV_ROWS + warp;
+    const int c8 = lane & 7, lb = lane >> 3, g = c8 >> 1, h = c8 & 1;
+    const bool live = row < J.n_out;
+    const uint8_t* wrow = (const uint8_t*) J.w + (size_t) (live ? row : 0) * nb * 144;
+    uint4 hdn = make_uint4(0, 0, 0, 0), qn = hdn;
+    if (live && lb < nb) {   // (the first weights are in flight while the activations are staged)
+        const uint4* blk = (const uint4*) wrow + lb * 9;
+        hdn = blk[0];
+        qn = blk[1 + c8];
+    }
+    const size_t cb = pq_col_bytes(n_in);
+    for (int c = 0; c < ncol; ++c) {
+        int4* xp = (int4*) (pq_sm + c * cb);
+        float* d8s = (float*) (xp + n_in / 8);
+        int* sums = (int*) (d8s + nsub);
+        const block_q8_1* x = (const block_q8_1*) ((const uint8_t*) J.xq + (size_t) c * J.xq_cstride);
+        for (int i = tid; i < nsub; i += 256) {
+            d8s[i] = __low2float(x[i].ds);
+            const int* qi = (const int*) x[i].qs;
+            const int bq = i >> 3, sg = (i & 7) >> 1, st = i & 1;
+            int s0 = 0, s1 = 0;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int u = qi[k];
+                const int a0 = (int8_t) u, a1 = (int8_t) (u >> 8), a2 = (int8_t) (u >> 16), a3 = u >> 24;
+                int* dst = (int*) &xp[bq * 32 + (st * 2 + ((k & 3) >> 1)) * 8 + ((k >> 2) * 4 + sg)] + (k & 1) * 2;
+                dst[0] = (a0 << 16) + a2;
+                dst[1] = (a1 << 16) + a3;
+                if (k < 4) s0 += a0 + a1 + a2 + a3; else s1 += a0 + a1 + a2 + a3;
+            }
+            sums[2 * i] = s0;
+            sums[2 * i + 1] = s1;
+        }
+    }
+    __syncthreads();
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+    for (int bb = lb; bb < nb; bb += 4) {
+        const uint4 hd = hdn, q = qn;
+        if (live && bb + 4 < nb) {
+            const uint4* blk = (const uint4*) wrow + (bb + 4) * 9;
+            hdn = blk[0];
+            qn = blk[1 + c8];
+        }
+        // the scales and mins of the eight sub-blocks (ggml's unpacking), then this lane's pair of sub-blocks
+        const uint32_t s0 = hd.y, s1 = hd.z, s2 = hd.w;
+        const uint32_t t0 = s0 & 0x3f3f3f3fu, t2 = s1 & 0x3f3f3f3fu;
+        const uint32_t t1 = (s2 & 0x0f0f0f0fu) | (((s0 >> 6) & 0x03030303u) << 4);
+        const uint32_t t3 = ((s2 >> 4) & 0x0f0f0f0fu) | (((s1 >> 6) & 0x03030303u) << 4);
+        const uint32_t scw = (g >> 1) ? t1 : t0, mnw = (g >> 1) ? t3 : t2;
+        const uint32_t scp = scw >> (16 * (g & 1)), mnp = mnw >> (16 * (g & 1));
+        const int scA = scp & 0xff, scB = (scp >> 8) & 0xff, mA = mnp & 0xff, mB = (mnp >> 8) & 0xff;
+        const float2 dm = __half22float2(*(const __half2*) &hd.x);
+        const uint32_t qa[4] = {q.x, q.y, q.z, q.w};
+        const int sa = bb * 8 + 2 * g;
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (c >= ncol) break;
+            const int4* xp = (const int4*) (pq_sm + c * cb);
+            const float* d8s = (const float*) (xp + n_in / 8);
+            const int* sums = (const int*) (d8s + nsub);
+            const int4 pA0 = xp[bb * 32 + h * 4 + g], pA1 = xp[bb * 32 + 8 + h * 4 + g];
+            const int4 pB0 = xp[bb * 32 + 16 + h * 4 + g], pB1 = xp[bb * 32 + 24 + h * 4 + g];
+            const int pA[8] = {pA0.x, pA0.y, pA0.z, pA0.w, pA1.x, pA1.y, pA1.z, pA1.w};
+            const int pB[8] = {pB0.x, pB0.y, pB0.z, pB0.w, pB1.x, pB1.y, pB1.z, pB1.w};
+            int accA = 0, accB = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                accA = pA[2 * k] * (int) (qa[k] & 0x000f000fu) + accA;
+                accA = pA[2 * k + 1] * (int) ((qa[k] >> 8) & 0x000f000fu) + accA;
+                accB = pB[2 * k] * (int) ((qa[k] >> 4) & 0x000f000fu) + accB;
+                accB = pB[2 * k + 1] * (int) ((qa[k] >> 12) & 0x000f000fu) + accB;
+            }
+            const int HA = (accA + 0x8000) >> 16, HB = (accB + 0x8000) >> 16;
+            const float dA = d8s[sa], dB = d8s[sa + 1];
+            const int sumA = sums[sa * 2 + h], sumB = sums[(sa + 1) * 2 + h];
+            acc[c] += dm.x * (dA * (HA * scA) + dB * (HB * scB)) - dm.y * (dA * (sumA * mA) + dB * (sumB * mB));
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float sum = warp_sum(acc[c]);
+        if (lane == 0 && live && c < ncol)
+            J.y[(size_t) c * J.y_cstride + row] = mv_out(J.alpha, sum, J.bias ? J.bias[row] : 0.0f);
+    }
+}
+
 // ---------------------------------------------------------------- the same GEMVs for NT activations at once (mv_nt)
 // Several conversations' tokens through one layer: activation t is xs q8_1 blocks (or n_in floats) after activation
 // t - 1, output t n_out floats after output t - 1.  Each lane makes row_dot's calls in row_dot's order for every
@@ -1915,6 +2136,77 @@ void mvc_launch(const MvBatch& b, int blocks, int nc, cudaStream_t s) {
     else mvc_kernel_t<T, 16><<<blocks, 256, 0, s>>>(b);
 }
 
+// whether the Pascal Q4_K GEMV above serves this device (compute 6.0, no dp4a; MAYA_GLM_PASCAL_MV=0: never), once per device
+bool pascal_mv_arch() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static int cache[64];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    if (cache[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        static const bool off = getenv("MAYA_GLM_PASCAL_MV") != nullptr && std::atoi(getenv("MAYA_GLM_PASCAL_MV")) == 0;
+        cache[dev] = major * 10 + minor < 61 && !off ? 1 : 2;
+    }
+    return cache[dev] == 1;
+#endif
+}
+
+// whether the Pascal IMAD Q4_K MoE expert kernels serve this device (cc 6.0; MAYA_GLM_PASCAL_MOE=0 disables)
+bool pascal_moe_q4k_arch() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static const bool off = getenv("MAYA_GLM_PASCAL_MOE") != nullptr && std::atoi(getenv("MAYA_GLM_PASCAL_MOE")) == 0;
+    return !off && pascal_mv_arch();
+#endif
+}
+
+// ... the Pascal Q4_K path's jobs: whether a job takes it, a job's columns cut into chunks that fit the shared memory
+// (each chunk a job of its own; its columns keep the one-column result), and the launches
+#if !defined(STRATA_USE_HIP)
+inline bool pq_ok(const MvJob& J) {
+    return J.type == 12 && J.ncol >= 1 && J.n_in % 256 == 0 && ((uintptr_t) J.w & 15) == 0 &&
+           pq_col_bytes(J.n_in) <= 46 * 1024;
+}
+inline int pq_split(const MvJob& J, MvJob* ent) {
+    const int cap = (int) std::min<size_t>(PQ_COLS, (46 * 1024) / pq_col_bytes(J.n_in));
+    int ne = 0;
+    for (int c0 = 0; c0 < J.ncol; c0 += cap) {
+        MvJob E = J;
+        E.ncol = std::min(cap, J.ncol - c0);
+        E.xq = (const uint8_t*) J.xq + (int64_t) c0 * J.xq_cstride;
+        if (J.xf != nullptr) E.xf = J.xf + (int64_t) c0 * J.xf_cstride;
+        E.y = J.y + (int64_t) c0 * J.y_cstride;
+        ent[ne++] = E;
+    }
+    return ne;
+}
+void pq_launch(const MvJob* ent, int ne, cudaStream_t s) {
+    for (int e0 = 0; e0 < ne; e0 += kMaxMvJobs) {
+        MvBatch b{};
+        b.skip = g_skip;
+        int acc = 0, m = 0, nc = 1;
+        size_t smem = 0;
+        for (int e = e0; e < ne && m < kMaxMvJobs; ++e) {
+            b.j[m] = ent[e];
+            acc += (ent[e].n_out + MV_ROWS - 1) / MV_ROWS;
+            b.blk_end[m++] = acc;
+            nc = std::max(nc, ent[e].ncol);
+            smem = std::max(smem, (size_t) ent[e].ncol * pq_col_bytes(ent[e].n_in));
+        }
+        b.n = m;
+        if (nc == 1) mv_q4k_pascal<1><<<acc, 256, smem, s>>>(b);
+        else if (nc == 2) mv_q4k_pascal<2><<<acc, 256, smem, s>>>(b);
+        else mv_q4k_pascal<4><<<acc, 256, smem, s>>>(b);
+    }
+}
+#endif
+
 // whether this device has the int8 mma.sync of the tensor-core GEMVs (NVIDIA sm_80+), asked once per device
 bool mma_arch() {
 #if defined(STRATA_USE_HIP)
@@ -2046,6 +2338,198 @@ __global__ void __launch_bounds__(256) mv_q6_p100_kernel(const STRATA_GRID_CONST
         const float v = warp_sum(s[r]);
         if (lane == 0 && row0 + r < J.n_out) J.y[row0 + r] = mv_out(J.alpha, v, J.bias ? J.bias[row0 + r] : 0.0f);
     }
+}
+
+// cc 6.0 (Tesla P100 / GP100): Q8_0 one-column GEMV.  8 block_q8_0 = 272 bytes = 17 x uint4 (16-byte aligned).
+// Each warp loads R rows of 17 coalesced LDG.E.128 words into a private 288-byte SMEM staging slot (2.3 KB static),
+// extracts each lane's 8 int8 weights with zero unaligned 16-bit loads, and computes the exact integer dot product
+// via magic-bias FP32 FMA (|sum| <= 131072 < 2^24, bit-for-bit identical to dot_q8_0) against SMEM-staged q8_1.
+// Measured on P100: 292 -> 401 GB/s (4096x4096), 333 -> 523 GB/s (24576x4096), 340 -> 546 GB/s (154880x4096 LM head).
+__device__ __forceinline__ float q8_s8_magic(uint32_t v, int shift) {
+    return __uint_as_float(0x4B000000u | (((v >> shift) & 0xffu) ^ 0x80u)) - 8388736.0f;
+}
+template<int R>
+__global__ void __launch_bounds__(256) mv_q8_p100_kernel(const STRATA_GRID_CONSTANT MvBatch b) {
+    if (b.skip != nullptr && *b.skip) return;
+    extern __shared__ int mvq8_xs[];
+    __shared__ __align__(16) uint32_t sw[MV_ROWS][72];
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    {
+        const int nw = (J.n_in / 32) * (int) (sizeof(block_q8_1) / 4);
+        for (int i = threadIdx.x; i < nw; i += blockDim.x) mvq8_xs[i] = ((const int*) J.xq)[i];
+        __syncthreads();
+    }
+    const block_q8_1* xs = (const block_q8_1*) mvq8_xs;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int row0 = ((bid - blk0) * MV_ROWS + warp) * R;
+    if (row0 >= J.n_out) return;
+    const size_t rb = rbytes<8>(J.n_in);
+    const uint8_t* wr[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wr[r] = (const uint8_t*) J.w + (size_t) min(row0 + r, J.n_out - 1) * rb;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    const int blk = lane >> 2, q = lane & 3;
+    const int off_b = blk * 34;
+    const int iw_d = off_b >> 2, sh_d = (off_b & 2) << 3;
+    const int off_q = off_b + 2 + 8 * q;
+    const int iw = off_q >> 2;
+    const bool even_blk = (blk & 1) == 0;
+    uint32_t* myw = sw[warp];
+    const int n8 = J.n_in / 256;
+    for (int c = 0; c < n8; ++c) {
+        uint4 ld[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            if (lane < 17) ld[r] = ((const uint4*) (wr[r] + (size_t) c * 272))[lane];
+        const block_q8_1* xb = xs + c * 8 + blk;
+        const float dx = __low2float(xb->ds);
+        const int u0 = ((const int*) xb->qs)[2 * q + 0];
+        const int u1 = ((const int*) xb->qs)[2 * q + 1];
+        const float x0 = (float) (int8_t) (u0), x1 = (float) (int8_t) (u0 >> 8);
+        const float x2 = (float) (int8_t) (u0 >> 16), x3 = (float) (int8_t) (u0 >> 24);
+        const float x4 = (float) (int8_t) (u1), x5 = (float) (int8_t) (u1 >> 8);
+        const float x6 = (float) (int8_t) (u1 >> 16), x7 = (float) (int8_t) (u1 >> 24);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (lane < 17) ((uint4*) myw)[lane] = ld[r];
+            __syncwarp();
+            const float d = __half2float(__ushort_as_half((uint16_t) (myw[iw_d] >> sh_d)));
+            uint32_t v0, v1;
+            if (even_blk) {
+                const uint32_t w0 = myw[iw], w1 = myw[iw + 1], w2 = myw[iw + 2];
+                v0 = __funnelshift_r(w0, w1, 16);
+                v1 = __funnelshift_r(w1, w2, 16);
+            } else {
+                v0 = myw[iw];
+                v1 = myw[iw + 1];
+            }
+            const float t = q8_s8_magic(v0, 0) * x0 + q8_s8_magic(v0, 8) * x1 +
+                            q8_s8_magic(v0, 16) * x2 + q8_s8_magic(v0, 24) * x3 +
+                            q8_s8_magic(v1, 0) * x4 + q8_s8_magic(v1, 8) * x5 +
+                            q8_s8_magic(v1, 16) * x6 + q8_s8_magic(v1, 24) * x7;
+            acc[r] += d * dx * t;
+            __syncwarp();
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float v = warp_sum(acc[r]);
+        if (lane == 0 && row0 + r < J.n_out) J.y[row0 + r] = mv_out(J.alpha, v, J.bias ? J.bias[row0 + r] : 0.0f);
+    }
+}
+
+// Pascal (sm_60) multi-column Q8_0 GEMV for speculative verify windows (MAYA_GLM_SPEC_WIN=2, NC in {2,3,4,5,8}):
+// loads each 272-byte group of 8 Q8_0 blocks ONCE via coalesced 17 x uint4 (LDG.E.128) into per-warp SMEM,
+// decodes the 8 int8 weights to FP32 via magic-bias once, and dots against all NC columns via native FP32 FMA.
+template<int NC, int R = (NC >= 5 ? 1 : 2)>
+__global__ void __launch_bounds__(256) mvc_q8_p100_kernel(const STRATA_GRID_CONSTANT MvBatch b, int smem_cols) {
+    if (b.skip != nullptr && *b.skip) return;
+    extern __shared__ int mvcq8_xs[];
+    __shared__ __align__(16) uint32_t sw[MV_ROWS][72];
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    const int ncol = J.ncol;
+    const int nw_col = (J.n_in / 32) * (int) (sizeof(block_q8_1) / 4);
+    const bool use_smem_x = smem_cols > 0 && ncol <= smem_cols;
+    if (use_smem_x) {
+        for (int c = 0; c < ncol; ++c) {
+            const int* src = (const int*) ((const uint8_t*) J.xq + (int64_t) c * J.xq_cstride);
+            int* dst = mvcq8_xs + c * nw_col;
+            for (int i = threadIdx.x; i < nw_col; i += blockDim.x) dst[i] = src[i];
+        }
+        __syncthreads();
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int row0 = ((bid - blk0) * MV_ROWS + warp) * R;
+    if (row0 >= J.n_out) return;
+    const size_t rb = rbytes<8>(J.n_in);
+    const uint8_t* wr[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) wr[r] = (const uint8_t*) J.w + (size_t) min(row0 + r, J.n_out - 1) * rb;
+    const block_q8_1* xc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const int cc = min(c, ncol - 1);
+        xc[c] = use_smem_x ? (const block_q8_1*) (mvcq8_xs + cc * nw_col)
+                           : (const block_q8_1*) ((const uint8_t*) J.xq + (int64_t) cc * J.xq_cstride);
+    }
+    float acc[R][NC];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
+    const int blk = lane >> 2, q = lane & 3;
+    const int off_b = blk * 34;
+    const int iw_d = off_b >> 2, sh_d = (off_b & 2) << 3;
+    const int off_q = off_b + 2 + 8 * q;
+    const int iw = off_q >> 2;
+    const bool even_blk = (blk & 1) == 0;
+    uint32_t* myw = sw[warp];
+    const int n8 = J.n_in / 256;
+    for (int k8 = 0; k8 < n8; ++k8) {
+        uint4 ld[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+            if (lane < 17) ld[r] = ((const uint4*) (wr[r] + (size_t) k8 * 272))[lane];
+        const int xblk = k8 * 8 + blk;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (lane < 17) ((uint4*) myw)[lane] = ld[r];
+            __syncwarp();
+            const float d = __half2float(__ushort_as_half((uint16_t) (myw[iw_d] >> sh_d)));
+            uint32_t v0, v1;
+            if (even_blk) {
+                const uint32_t w0 = myw[iw], w1 = myw[iw + 1], w2 = myw[iw + 2];
+                v0 = __funnelshift_r(w0, w1, 16);
+                v1 = __funnelshift_r(w1, w2, 16);
+            } else {
+                v0 = myw[iw];
+                v1 = myw[iw + 1];
+            }
+            const float wf0 = q8_s8_magic(v0, 0), wf1 = q8_s8_magic(v0, 8);
+            const float wf2 = q8_s8_magic(v0, 16), wf3 = q8_s8_magic(v0, 24);
+            const float wf4 = q8_s8_magic(v1, 0), wf5 = q8_s8_magic(v1, 8);
+            const float wf6 = q8_s8_magic(v1, 16), wf7 = q8_s8_magic(v1, 24);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const block_q8_1* xb = xc[c] + xblk;
+                const float dx = __low2float(xb->ds);
+                const int u0 = ((const int*) xb->qs)[2 * q + 0];
+                const int u1 = ((const int*) xb->qs)[2 * q + 1];
+                const float t = wf0 * (float) (int8_t) (u0) + wf1 * (float) (int8_t) (u0 >> 8) +
+                                wf2 * (float) (int8_t) (u0 >> 16) + wf3 * (float) (int8_t) (u0 >> 24) +
+                                wf4 * (float) (int8_t) (u1) + wf5 * (float) (int8_t) (u1 >> 8) +
+                                wf6 * (float) (int8_t) (u1 >> 16) + wf7 * (float) (int8_t) (u1 >> 24);
+                acc[r][c] += d * dx * t;
+            }
+            __syncwarp();
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float v = warp_sum(acc[r][c]);
+            if (lane == 0 && c < ncol && row0 + r < J.n_out)
+                J.y[c * J.y_cstride + row0 + r] = mv_out(J.alpha, v, J.bias ? J.bias[row0 + r] : 0.0f);
+        }
+}
+
+void mvc_q8_p100_launch(const MvBatch& b, int blocks, int nc, size_t smem_bytes, int smem_cols, cudaStream_t s) {
+    if (nc <= 2) mvc_q8_p100_kernel<2><<<blocks, 256, smem_bytes, s>>>(b, smem_cols);
+    else if (nc == 3) mvc_q8_p100_kernel<3><<<blocks, 256, smem_bytes, s>>>(b, smem_cols);
+    else if (nc == 4) mvc_q8_p100_kernel<4><<<blocks, 256, smem_bytes, s>>>(b, smem_cols);
+    else if (nc == 5) mvc_q8_p100_kernel<5><<<blocks, 256, smem_bytes, s>>>(b, smem_cols);
+    else mvc_q8_p100_kernel<8><<<blocks, 256, smem_bytes, s>>>(b, smem_cols);
 }
 #endif
 // moe_gate_up on cc 6.0 stages the layer input in shared memory (MAYA_GLM_GU_STAGE=0: it reads it from global)
@@ -4955,6 +5439,136 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     }
 }
 
+#if !defined(STRATA_USE_HIP)
+// ---- Pascal (sm_60) IMAD-packed Q4_K MoE expert kernels (no dp4a, 16-byte coalesced weight loads, SMEM-staged x)
+// Reuses mv_q4k_pascal's exact pair-IMAD arithmetic (pq_stage_sub + pq_dot_blk):
+//   - moe_gate_up_q4k_pascal_kernel: stages xq once per block (9.5 KB for n_embd=4096 -> up to 4 blocks/SM),
+//     each warp computes 2 gate + 2 up rows sharing one SMEM load per super-block (4x activation reuse).
+//   - moe_down_q4k_pascal_kernel: stages hq per warp in 1024-element K-tiles (2,432 B/warp x 8 = 19.5 KB -> 3 blocks/SM),
+//     one sub-block per lane with warp-only sync (__syncwarp), 4 output rows sharing one SMEM load per tile.
+__global__ void __launch_bounds__(GU_WARPS * 32)
+moe_gate_up_q4k_pascal_kernel(MoeDev d, int n_embd, int n_ff, float limit,
+                              const block_q8_1* __restrict__ xq, block_q8_1* __restrict__ hq) {
+    if (d.skip != nullptr && *d.skip) return;
+    const int ei = blockIdx.y, chunk = blockIdx.x;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const unsigned long long ptr = d.plan_ptr[ei];
+    if (ptr == 0ull) return;
+    extern __shared__ __align__(16) unsigned char pq_sm[];
+    __shared__ float sg[GU_ROWS], su[GU_ROWS];
+    const int nb = n_embd / 256, nsub = n_embd / 32;
+    int4* xp = (int4*) pq_sm;
+    float* d8s = (float*) (xp + n_embd / 8);
+    int* sums = (int*) (d8s + nsub);
+    for (int i = tid; i < nsub; i += GU_WARPS * 32) pq_stage_sub(xq[i], i, xp, d8s, sums);
+    __syncthreads();
+    const size_t rb = (size_t) nb * 144;
+    const uint8_t* blob = (const uint8_t*) ptr;
+    constexpr int RPW = GU_ROWS / GU_WARPS;
+    const int r_base = chunk * GU_ROWS + warp * RPW;
+    const uint8_t* g0 = blob + (size_t) r_base * rb;
+    const uint8_t* u0 = g0 + (size_t) n_ff * rb;
+    const int c8 = lane & 7, lb = lane >> 3, g = c8 >> 1, h = c8 & 1;
+    float acc[2 * RPW];
+#pragma unroll
+    for (int r = 0; r < 2 * RPW; ++r) acc[r] = 0.0f;
+    for (int bb = lb; bb < nb; bb += 4) {
+        const int sa = bb * 8 + 2 * g;
+        const int4 pA0 = xp[bb * 32 + h * 4 + g], pA1 = xp[bb * 32 + 8 + h * 4 + g];
+        const int4 pB0 = xp[bb * 32 + 16 + h * 4 + g], pB1 = xp[bb * 32 + 24 + h * 4 + g];
+        const int pA[8] = {pA0.x, pA0.y, pA0.z, pA0.w, pA1.x, pA1.y, pA1.z, pA1.w};
+        const int pB[8] = {pB0.x, pB0.y, pB0.z, pB0.w, pB1.x, pB1.y, pB1.z, pB1.w};
+        const float dA = d8s[sa], dB = d8s[sa + 1];
+        const int sumA = sums[sa * 2 + h], sumB = sums[(sa + 1) * 2 + h];
+#pragma unroll
+        for (int j = 0; j < RPW; ++j) {
+            acc[j] += pq_dot_blk((const uint4*) (g0 + (size_t) j * rb) + bb * 9, c8, g, pA, pB, dA, dB, sumA, sumB);
+            acc[RPW + j] += pq_dot_blk((const uint4*) (u0 + (size_t) j * rb) + bb * 9, c8, g, pA, pB, dA, dB, sumA, sumB);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < 2 * RPW; ++r) acc[r] = warp_sum(acc[r]);
+    if (lane == 0) {
+#pragma unroll
+        for (int j = 0; j < RPW; ++j) {
+            sg[warp * RPW + j] = acc[j];
+            su[warp * RPW + j] = acc[RPW + j];
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const float gv = fminf(sg[lane], limit);
+        const float u = fminf(fmaxf(su[lane], -limit), limit);
+        q8_1_store_warp((gv / (1.0f + expf(-gv))) * u, hq + (size_t) ei * (n_ff / 32) + chunk, lane);
+    }
+}
+
+constexpr int PASCAL_DOWN_ROWS = 8;
+
+__global__ void __launch_bounds__(256)
+moe_down_q4k_pascal_kernel(MoeDev d, int k, int n_embd, int n_ff, size_t down_off,
+                           const block_q8_1* __restrict__ hq,
+                           const float* __restrict__ sh_out, float* __restrict__ out) {
+    if (d.skip != nullptr && *d.skip) return;
+    extern __shared__ __align__(16) unsigned char pq_sm[];
+    __shared__ unsigned long long s_ptr[8];
+    __shared__ float s_w[8];
+    __shared__ float s_part[8][PASCAL_DOWN_ROWS];
+    if (threadIdx.x < 8) {
+        s_ptr[threadIdx.x] = (int) threadIdx.x < k ? d.plan_ptr[threadIdx.x] : 0ull;
+        s_w[threadIdx.x] = (int) threadIdx.x < k ? d.plan_w[threadIdx.x] : 0.0f;
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int r0 = blockIdx.x * PASCAL_DOWN_ROWS;
+    const size_t drb = (size_t) (n_ff / 256) * 144;
+    float acc[PASCAL_DOWN_ROWS];
+#pragma unroll
+    for (int j = 0; j < PASCAL_DOWN_ROWS; ++j) acc[j] = 0.0f;
+    if (warp < k && s_ptr[warp] != 0ull) {
+        const uint8_t* base = (const uint8_t*) s_ptr[warp] + down_off + (size_t) r0 * drb;
+        constexpr size_t kTileBytes = pq_col_bytes(1024);
+        unsigned char* wsm = pq_sm + (size_t) warp * kTileBytes;
+        int4* xp = (int4*) wsm;
+        float* d8s = (float*) (xp + 128);
+        int* sums = (int*) (d8s + 32);
+        const block_q8_1* hq_w = hq + (size_t) warp * (n_ff / 32);
+        const int c8 = lane & 7, lb = lane >> 3, g = c8 >> 1, h = c8 & 1;
+        const int n_tiles = n_ff / 1024;
+        for (int t = 0; t < n_tiles; ++t) {
+            pq_stage_sub(hq_w[t * 32 + lane], lane, xp, d8s, sums);
+            __syncwarp();
+            const int sa = lb * 8 + 2 * g;
+            const int4 pA0 = xp[lb * 32 + h * 4 + g], pA1 = xp[lb * 32 + 8 + h * 4 + g];
+            const int4 pB0 = xp[lb * 32 + 16 + h * 4 + g], pB1 = xp[lb * 32 + 24 + h * 4 + g];
+            const int pA[8] = {pA0.x, pA0.y, pA0.z, pA0.w, pA1.x, pA1.y, pA1.z, pA1.w};
+            const int pB[8] = {pB0.x, pB0.y, pB0.z, pB0.w, pB1.x, pB1.y, pB1.z, pB1.w};
+            const float dA = d8s[sa], dB = d8s[sa + 1];
+            const int sumA = sums[sa * 2 + h], sumB = sums[(sa + 1) * 2 + h];
+            const int bbg = t * 4 + lb;
+#pragma unroll
+            for (int j = 0; j < PASCAL_DOWN_ROWS; ++j)
+                acc[j] += pq_dot_blk((const uint4*) (base + (size_t) j * drb) + bbg * 9, c8, g, pA, pB, dA, dB, sumA, sumB);
+            __syncwarp();
+        }
+#pragma unroll
+        for (int j = 0; j < PASCAL_DOWN_ROWS; ++j) acc[j] = warp_sum(acc[j]);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int j = 0; j < PASCAL_DOWN_ROWS; ++j) s_part[warp][j] = acc[j];
+    }
+    __syncthreads();
+    if (threadIdx.x < PASCAL_DOWN_ROWS) {
+        const int j = threadIdx.x, r = r0 + j;
+        float m = 0.0f;
+        for (int i = 0; i < k; ++i) m += s_w[i] * s_part[i][j];
+        if (*d.cpu_flag) m += d.cpu_part[r];
+        out[r] = m + (sh_out != nullptr ? sh_out[r] : 0.0f);
+    }
+}
+#endif
+
 // ---------------------------------------------------------------- the prompt path's lightly routed experts
 // An expert with a few rows (tokens) of a prompt chunk: its weights read ONCE, each 32-value sub-block decoded once
 // and dotted with up to LR_MT tokens at a time (MMQ computes tiles of 64-128 tokens - mostly empty at ~10 rows an
@@ -4997,11 +5611,10 @@ __device__ __forceinline__ void dwm(const uint8_t* row, int kbx, int iqs, const 
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
-            const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            g[l0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
-            g[l0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+            int _sg0, _sg1;
+            sign_pair(grid_pos.x, grid_pos.y, aux32 >> (7 * l0 / 2), _sg0, _sg1);
+            g[l0] = _sg0;
+            g[l0 + 1] = _sg1;
         }
         const int ls = aux32 >> 28;
         const float d = __half2float(bq3->d);
@@ -5021,12 +5634,11 @@ __device__ __forceinline__ void dwm(const uint8_t* row, int kbx, int iqs, const 
         const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
 #pragma unroll
         for (int k0 = 0; k0 < 8; k0 += 2) {
-            const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
-            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            g[k0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
-            g[k0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+            const uint2 grid_pos = sm60_tab_u2<256>(tab, aux8[k0 / 2]);
+            int _sg0, _sg1;
+            sign_pair(grid_pos.x, grid_pos.y, aux32 >> (7 * k0 / 2), _sg0, _sg1);
+            g[k0] = _sg0;
+            g[k0 + 1] = _sg1;
         }
         const int ls = aux32 >> 27 | 1;
         const float d = __half2float(bq2->d);
@@ -5071,11 +5683,10 @@ __device__ __forceinline__ void dec_sub(const uint8_t* row, int kbx, int iqs, co
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
-            const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            o.g[l0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
-            o.g[l0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+            int _sg0, _sg1;
+            sign_pair(grid_pos.x, grid_pos.y, aux32 >> (7 * l0 / 2), _sg0, _sg1);
+            o.g[l0] = _sg0;
+            o.g[l0 + 1] = _sg1;
         }
         o.ls = aux32 >> 28;
         o.a = __half2float(bq3->d);
@@ -5086,12 +5697,11 @@ __device__ __forceinline__ void dec_sub(const uint8_t* row, int kbx, int iqs, co
         const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
 #pragma unroll
         for (int k0 = 0; k0 < 8; k0 += 2) {
-            const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
-            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            o.g[k0] = (int) __vsub4(grid_pos.x ^ signs0, signs0);
-            o.g[k0 + 1] = (int) __vsub4(grid_pos.y ^ signs1, signs1);
+            const uint2 grid_pos = sm60_tab_u2<256>(tab, aux8[k0 / 2]);
+            int _sg0, _sg1;
+            sign_pair(grid_pos.x, grid_pos.y, aux32 >> (7 * k0 / 2), _sg0, _sg1);
+            o.g[k0] = _sg0;
+            o.g[k0 + 1] = _sg1;
         }
         o.ls = aux32 >> 27 | 1;
         o.a = __half2float(bq2->d);
@@ -5715,6 +6325,20 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         }
     }
 #endif
+#if !defined(STRATA_USE_HIP)
+    // Q4_K on a Pascal card (no dp4a): every Q4_K job, whatever its column count, from the pair-IMAD kernel, so that a
+    // column, an mv_nt activation and a one-column call all have one result
+    if (typed && pascal_mv_arch()) {
+        MvJob ent[kMaxMvJobs * kMaxMvCols];
+        int ne = 0;
+        for (int i = 0; i < n; ++i)
+            if (!done[i] && pq_ok(jobs[i])) {
+                ne += pq_split(jobs[i], ent + ne);
+                done[i] = true;
+            }
+        if (ne > 0) pq_launch(ent, ne, s);
+    }
+#endif
     // several columns: the tiled kernels (MAYA_GLM_MV_TILED=0: the column loops)
     static const bool tiled = [] {
         const char* v = getenv("MAYA_GLM_MV_TILED");
@@ -5758,8 +6382,37 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             const bool use_mma = T == 8 && mma;
             for (int i = 0; i < n; ++i)
                 if (!done[i] && jobs[i].type == T && jobs[i].ncol > 1) nc = std::max(nc, jobs[i].ncol);
+            bool use_p100_q8 = false;
+            size_t p100_smem = 0;
+            int p100_smem_cols = 0;
+#if !defined(STRATA_USE_HIP)
+            if (T == 8 && !use_mma && nc > 1 && nc <= 8) {
+                static const bool q8_off =
+                    getenv("MAYA_GLM_MV_Q8_P100") != nullptr && std::atoi(getenv("MAYA_GLM_MV_Q8_P100")) == 0;
+                if (!q8_off && p100_mv_mode() > 0) {
+                    int max_in = 0;
+                    bool aligned_ok = true;
+                    for (int i = 0; i < n; ++i)
+                        if (!done[i] && jobs[i].type == T && jobs[i].ncol > 1) {
+                            max_in = std::max(max_in, jobs[i].n_in);
+                            if (jobs[i].n_in % 256 != 0 || ((uintptr_t) jobs[i].w & 15) != 0) aligned_ok = false;
+                        }
+                    if (aligned_ok && max_in > 0) {
+                        use_p100_q8 = true;
+                        const size_t per_col = (size_t) (max_in / 32) * sizeof(block_q8_1);
+                        if (per_col * (size_t) nc <= 32 * 1024) {
+                            p100_smem = per_col * (size_t) nc;
+                            p100_smem_cols = nc;
+                        }
+                    }
+                }
+            }
+#endif
             const int nc_t = nc <= 2 ? 2 : nc <= 4 ? 4 : nc <= 8 ? 8 : 16;   // mvc_launch's instantiation
-            const int per = T == kTypeBF16 ? MV_ROWS : use_mma ? 16 : MV_ROWS * mvc_rows(T, nc_t);   // rows a block
+            const int per = T == kTypeBF16 ? MV_ROWS
+                          : use_mma ? 16
+                          : use_p100_q8 ? MV_ROWS * (nc >= 5 ? 1 : 2)
+                          : MV_ROWS * mvc_rows(T, nc_t);   // rows a block
             for (int i = 0; i < n; ++i)
                 if (!done[i] && jobs[i].type == T && jobs[i].ncol > 1) {
                     b.j[m] = jobs[i];
@@ -5771,6 +6424,10 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             b.n = m;
             if (use_mma)
                 mvc_mma_q8_0<<<acc, MMA_W * 32, 0, s>>>(b);
+#if !defined(STRATA_USE_HIP)
+            else if (use_p100_q8)
+                mvc_q8_p100_launch(b, acc, nc, p100_smem, p100_smem_cols, s);
+#endif
             else if (T == 8)
                 mvc_launch<8>(b, acc, nc, s);
             else if (T == 12)
@@ -5843,6 +6500,23 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
                     xs_bytes = (size_t) (max_in / 32) * sizeof(block_q8_1);
                     if (rows >= 1024 && xs_bytes <= 48 * 1024) pr = mode > 1 ? mode : rows < 4096 ? 2 : 4;
                 }
+            } else if (T == 8) {
+                static const bool q8_off = getenv("MAYA_GLM_MV_Q8_P100") != nullptr && std::atoi(getenv("MAYA_GLM_MV_Q8_P100")) == 0;
+                if (!q8_off) {
+                    if (const int mode = p100_mv_mode(); mode > 0) {
+                        int rows = 0, max_in = 0;
+                        bool aligned_ok = true;
+                        for (int i = 0; i < n; ++i)
+                            if (!done[i] && jobs[i].type == T) {
+                                rows += jobs[i].n_out;
+                                max_in = std::max(max_in, jobs[i].n_in);
+                                if (jobs[i].n_in % 256 != 0 || ((uintptr_t) jobs[i].w & 15) != 0) aligned_ok = false;
+                            }
+                        xs_bytes = (size_t) (max_in / 32) * sizeof(block_q8_1);
+                        if (aligned_ok && rows >= 512 && xs_bytes <= 44 * 1024)
+                            pr = mode > 1 ? mode : rows < 4096 ? 2 : 4;
+                    }
+                }
             }
 #endif
             const int per = MV_ROWS * (pr > 0 ? pr : 1);
@@ -5857,8 +6531,13 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             b.n = m;
 #if !defined(STRATA_USE_HIP)
             if (pr > 0) {
-                if (pr == 2) mv_q6_p100_kernel<2><<<acc, 256, xs_bytes, s>>>(b);
-                else mv_q6_p100_kernel<4><<<acc, 256, xs_bytes, s>>>(b);
+                if (T == 14) {
+                    if (pr == 2) mv_q6_p100_kernel<2><<<acc, 256, xs_bytes, s>>>(b);
+                    else mv_q6_p100_kernel<4><<<acc, 256, xs_bytes, s>>>(b);
+                } else {
+                    if (pr == 2) mv_q8_p100_kernel<2><<<acc, 256, xs_bytes, s>>>(b);
+                    else mv_q8_p100_kernel<4><<<acc, 256, xs_bytes, s>>>(b);
+                }
                 continue;
             }
 #endif
@@ -5891,6 +6570,24 @@ namespace {
 template<int NT>
 void mv_nt_launch(const MvJob* jobs, int n, bool typed, bool* done, cudaStream_t s) {
     constexpr int kTyped[] = {14, 8, 12, 13};
+#if !defined(STRATA_USE_HIP)
+    if (typed && pascal_mv_arch()) {   // (Q4_K on a Pascal card: the NT activations are columns of the pair-IMAD kernel)
+        MvJob ent[kMaxMvJobs * kMaxMvCols];
+        int ne = 0;
+        for (int i = 0; i < n; ++i) {
+            MvJob J = jobs[i];
+            J.ncol = NT;
+            J.xq_cstride = (int64_t) (J.n_in / 32) * (int64_t) sizeof(block_q8_1);
+            J.xf_cstride = J.n_in;
+            J.y_cstride = J.n_out;
+            if (!done[i] && pq_ok(J)) {
+                ne += pq_split(J, ent + ne);
+                done[i] = true;
+            }
+        }
+        if (ne > 0) pq_launch(ent, ne, s);
+    }
+#endif
     if (typed) {
         for (const int T : kTyped) {
             MvBatch b{};
@@ -6943,6 +7640,19 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     const auto* SD = (const uint8_t*) sh_down;
     const auto* SH = (const block_q8_1*) sh_hq;
     const int kk = sh ? k : k + 1;   // no shared expert: no block has blockIdx.y == kk
+#if !defined(STRATA_USE_HIP)
+    if (gu_type == 12 && pascal_moe_q4k_arch() && n_embd % 256 == 0 && pq_col_bytes(n_embd) <= 46 * 1024) {
+        const dim3 grid_routed((unsigned) (n_ff / GU_ROWS), (unsigned) k);
+        moe_gate_up_q4k_pascal_kernel<<<grid_routed, GU_WARPS * 32, pq_col_bytes(n_embd), s>>>(
+            d, n_embd, n_ff, limit, X, H);
+        if (sh) {
+            MvJob shj{sh_down, sh_hq, nullptr, sh_out, nullptr, 1.0f, sh_type, n_ff_sh, n_embd};
+            mv(&shj, 1, s);
+        }
+        launch_check("moe_gate_up Q4_K pascal");
+        return;
+    }
+#endif
     // cc 6.0: the room to stage the layer input in shared memory (moe_gate_up_kernel takes it when given)
     const size_t gx = sm60_gu_stage() && n_embd <= 4 * 4096 ? (size_t) (n_embd / 32) * sizeof(block_q8_1) : 0;
     switch (gu_type) {
@@ -7055,6 +7765,15 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
 #endif
     const int blocks = n_embd / DOWN_ROWS;   // n_embd % DOWN_ROWS == 0 (4096)
     const auto* H = (const block_q8_1*) hq;
+#if !defined(STRATA_USE_HIP)
+    if (d_type == 12 && pascal_moe_q4k_arch() && n_embd % PASCAL_DOWN_ROWS == 0 && n_ff % 1024 == 0 &&
+        (down_off & 15) == 0 && k <= 8) {
+        moe_down_q4k_pascal_kernel<<<n_embd / PASCAL_DOWN_ROWS, 256, (size_t) k * pq_col_bytes(1024), s>>>(
+            d, k, n_embd, n_ff, down_off, H, sh_out, out);
+        launch_check("moe_down Q4_K pascal");
+        return;
+    }
+#endif
     switch (d_type) {
 #define GLMF_DN(T) \
         case T: moe_down_kernel<T><<<blocks, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out); break;
@@ -7295,6 +8014,119 @@ __global__ void __launch_bounds__(256) moe_win_down_kernel(const STRATA_GRID_CON
     }
 }
 
+#if !defined(STRATA_USE_HIP)
+__global__ void __launch_bounds__(GU_WARPS * 32)
+moe_win_gu_q4k_pascal_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
+    const int g = blockIdx.y, chunk = blockIdx.x;
+    if (g >= *w.n_groups) return;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    extern __shared__ __align__(16) unsigned char pq_sm[];
+    __shared__ float sg[GU_ROWS], su[GU_ROWS];
+    const int nb = w.n_embd / 256, nsub = w.n_embd / 32;
+    int4* xp = (int4*) pq_sm;
+    float* d8s = (float*) (xp + w.n_embd / 8);
+    int* sums = (int*) (d8s + nsub);
+    const size_t rb = (size_t) nb * 144;
+    const uint8_t* blob = (const uint8_t*) w.grp_ptr[g];
+    constexpr int RPW = GU_ROWS / GU_WARPS;
+    const uint8_t* rows[2 * RPW];
+#pragma unroll
+    for (int j = 0; j < RPW; ++j) {
+        const int r = chunk * GU_ROWS + warp * RPW + j;
+        rows[j] = blob + (size_t) r * rb;
+        rows[RPW + j] = blob + (size_t) w.n_ff * rb + (size_t) r * rb;
+    }
+    const int c8 = lane & 7, lb = lane >> 3, gg = c8 >> 1, h = c8 & 1;
+    for (int m = w.grp_start[g]; m < w.grp_start[g + 1]; ++m) {
+        const int e = w.grp_ent[m], t = e >> 3;
+        const block_q8_1* xq = (const block_q8_1*) ((const uint8_t*) w.xq + (size_t) t * w.xq_stride);
+        for (int i = tid; i < nsub; i += GU_WARPS * 32) pq_stage_sub(xq[i], i, xp, d8s, sums);
+        __syncthreads();
+        float acc[2 * RPW];
+#pragma unroll
+        for (int r = 0; r < 2 * RPW; ++r) acc[r] = 0.0f;
+        for (int bb = lb; bb < nb; bb += 4) {
+            const int sa = bb * 8 + 2 * gg;
+            const int4 pA0 = xp[bb * 32 + h * 4 + gg], pA1 = xp[bb * 32 + 8 + h * 4 + gg];
+            const int4 pB0 = xp[bb * 32 + 16 + h * 4 + gg], pB1 = xp[bb * 32 + 24 + h * 4 + gg];
+            const int pA[8] = {pA0.x, pA0.y, pA0.z, pA0.w, pA1.x, pA1.y, pA1.z, pA1.w};
+            const int pB[8] = {pB0.x, pB0.y, pB0.z, pB0.w, pB1.x, pB1.y, pB1.z, pB1.w};
+            const float dA = d8s[sa], dB = d8s[sa + 1];
+            const int sumA = sums[sa * 2 + h], sumB = sums[(sa + 1) * 2 + h];
+#pragma unroll
+            for (int r = 0; r < 2 * RPW; ++r)
+                acc[r] += pq_dot_blk((const uint4*) rows[r] + bb * 9, c8, gg, pA, pB, dA, dB, sumA, sumB);
+        }
+#pragma unroll
+        for (int r = 0; r < 2 * RPW; ++r) acc[r] = warp_sum(acc[r]);
+        if (lane == 0) {
+#pragma unroll
+            for (int j = 0; j < RPW; ++j) {
+                sg[warp * RPW + j] = acc[j];
+                su[warp * RPW + j] = acc[RPW + j];
+            }
+        }
+        __syncthreads();
+        if (warp == 0) {
+            const float gv = fminf(sg[lane], w.limit);
+            const float u = fminf(fmaxf(su[lane], -w.limit), w.limit);
+            q8_1_store_warp((gv / (1.0f + expf(-gv))) * u, (block_q8_1*) w.hq + (size_t) e * (w.n_ff / 32) + chunk, lane);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void __launch_bounds__(256)
+moe_win_down_q4k_pascal_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
+    const int g = blockIdx.y;
+    if (g >= *w.n_groups) return;
+    extern __shared__ __align__(16) unsigned char pq_sm[];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int r0 = blockIdx.x * DOWN_ROWS;
+    const size_t drb = (size_t) (w.n_ff / 256) * 144;
+    const uint8_t* blob = (const uint8_t*) w.grp_ptr[g];
+    const uint8_t* rows[DOWN_ROWS];
+#pragma unroll
+    for (int j = 0; j < DOWN_ROWS; ++j) rows[j] = blob + w.down_off + (size_t) (r0 + j) * drb;
+    constexpr size_t kTileBytes = pq_col_bytes(1024);
+    unsigned char* wsm = pq_sm + (size_t) warp * kTileBytes;
+    int4* xp = (int4*) wsm;
+    float* d8s = (float*) (xp + 128);
+    int* sums = (int*) (d8s + 32);
+    const int c8 = lane & 7, lb = lane >> 3, gg = c8 >> 1, h = c8 & 1;
+    const int n_tiles = w.n_ff / 1024;
+    for (int m = w.grp_start[g] + warp; m < w.grp_start[g + 1]; m += 8) {
+        const int e = w.grp_ent[m];
+        const block_q8_1* hq_e = (const block_q8_1*) w.hq + (size_t) e * (w.n_ff / 32);
+        float acc[DOWN_ROWS];
+#pragma unroll
+        for (int j = 0; j < DOWN_ROWS; ++j) acc[j] = 0.0f;
+        for (int t = 0; t < n_tiles; ++t) {
+            pq_stage_sub(hq_e[t * 32 + lane], lane, xp, d8s, sums);
+            __syncwarp();
+            const int sa = lb * 8 + 2 * gg;
+            const int4 pA0 = xp[lb * 32 + h * 4 + gg], pA1 = xp[lb * 32 + 8 + h * 4 + gg];
+            const int4 pB0 = xp[lb * 32 + 16 + h * 4 + gg], pB1 = xp[lb * 32 + 24 + h * 4 + gg];
+            const int pA[8] = {pA0.x, pA0.y, pA0.z, pA0.w, pA1.x, pA1.y, pA1.z, pA1.w};
+            const int pB[8] = {pB0.x, pB0.y, pB0.z, pB0.w, pB1.x, pB1.y, pB1.z, pB1.w};
+            const float dA = d8s[sa], dB = d8s[sa + 1];
+            const int sumA = sums[sa * 2 + h], sumB = sums[(sa + 1) * 2 + h];
+            const int bbg = t * 4 + lb;
+#pragma unroll
+            for (int j = 0; j < DOWN_ROWS; ++j)
+                acc[j] += pq_dot_blk((const uint4*) rows[j] + bbg * 9, c8, gg, pA, pB, dA, dB, sumA, sumB);
+            __syncwarp();
+        }
+#pragma unroll
+        for (int j = 0; j < DOWN_ROWS; ++j) acc[j] = warp_sum(acc[j]);
+        if (lane == 0) {
+#pragma unroll
+            for (int j = 0; j < DOWN_ROWS; ++j) w.part[(size_t) e * w.n_embd + r0 + j] = acc[j];
+        }
+    }
+}
+#endif
+
 // each token's output rows: its entries' partials in plan order, the host's disk answer, the shared expert (moe_down's
 // combine)
 __global__ void moe_win_combine_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
@@ -7319,6 +8151,11 @@ bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s, b
     else moe_win_group_kernel<<<1, 32, 0, s>>>(w);
     const int G = w.T * w.k;   // groups at most (the blocks past the real count return at once)
     const dim3 ggu((unsigned) (w.n_ff / GU_ROWS), (unsigned) G), gdn((unsigned) (w.n_embd / DOWN_ROWS), (unsigned) G);
+#if !defined(STRATA_USE_HIP)
+    if (gu_type == 12 && pascal_moe_q4k_arch() && w.n_embd % 256 == 0 && pq_col_bytes(w.n_embd) <= 46 * 1024) {
+        moe_win_gu_q4k_pascal_kernel<<<ggu, GU_WARPS * 32, pq_col_bytes(w.n_embd), s>>>(w);
+    } else
+#endif
     switch (gu_type) {
 #define GLMF_WGU(T)         case T: moe_win_gu_kernel<T><<<ggu, GU_WARPS * 32, 0, s>>>(w); break;
         GLMF_WGU(16) GLMF_WGU(18) GLMF_WGU(19) GLMF_WGU(23) GLMF_WGU(10) GLMF_WGU(11) GLMF_WGU(17) GLMF_WGU(22)
@@ -7326,6 +8163,11 @@ bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s, b
 #undef GLMF_WGU
         default: return false;
     }
+#if !defined(STRATA_USE_HIP)
+    if (d_type == 12 && pascal_moe_q4k_arch() && w.n_ff % 1024 == 0 && (w.down_off & 15) == 0) {
+        moe_win_down_q4k_pascal_kernel<<<gdn, 256, 8 * pq_col_bytes(1024), s>>>(w);
+    } else
+#endif
     switch (d_type) {
 #define GLMF_WDN(T)         case T: moe_win_down_kernel<T><<<gdn, 256, 0, s>>>(w); break;
         GLMF_WDN(16) GLMF_WDN(18) GLMF_WDN(19) GLMF_WDN(23) GLMF_WDN(10) GLMF_WDN(11) GLMF_WDN(17) GLMF_WDN(22)

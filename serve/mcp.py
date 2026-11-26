@@ -470,7 +470,10 @@ def result_text(result: dict) -> str:
                                                                   f"({res.get('mimeType', 'binary')}), not shown]")
         elif kind == "resource_link":
             parts.append(f"[resource link: {block.get('name') or ''} {block.get('uri', '')}]".replace("  ", " "))
-        elif kind in ("image", "audio"):
+        elif kind == "image":
+            size = len(block.get("data") or "") * 3 // 4
+            parts.append(f"[image ({block.get('mimeType', '?')}, {size:,} bytes)]")
+        elif kind == "audio":
             size = len(block.get("data") or "") * 3 // 4
             parts.append(f"[{kind} ({block.get('mimeType', '?')}, {size:,} bytes): not shown to the model]")
         else:
@@ -478,6 +481,16 @@ def result_text(result: dict) -> str:
     if not parts and result.get("structuredContent") is not None:
         parts.append(json.dumps(result["structuredContent"], ensure_ascii=False))
     return "\n".join(parts)
+
+
+def result_images(result: dict) -> list[str]:
+    """Extract data: URIs from MCP image blocks so multimodal engines can feed them to their vision tower."""
+    out = []
+    for block in result.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "image" and block.get("data"):
+            mime = str(block.get("mimeType") or "image/png")
+            out.append(f"data:{mime};base64,{block['data']}")
+    return out
 
 
 def _clean(name: str) -> str:
@@ -547,13 +560,17 @@ class McpHub:
         t0 = time.monotonic()
         server, tool = self._routes.get(name) or self.routes().get(name, (None, name))
         out = {"server": server.name if server else None, "tool": tool}
+        images: list[str] = []
         if server is None:
-            text, ok = f"error: there is no tool named {name!r}", False
+            avail = ", ".join(sorted(self._routes or self.routes()))
+            text, ok = f"error: there is no tool named {name!r}. Available tools: {avail}", False
         else:
             try:
                 res = server.call(tool, arguments if isinstance(arguments, dict) else {},
                                   float(self.settings["timeout_s"]), cancel)
                 text, ok = result_text(res), not res.get("isError")
+                if ok:
+                    images = result_images(res)
                 if not ok:
                     text = "error: " + (text or "the tool reported an error")
             except McpCancelled:
@@ -565,7 +582,7 @@ class McpHub:
         if cap > 0 and full > cap:
             text = text[:cap] + (f"\n\n[... truncated: the tool returned {full:,} characters; only the first "
                                  f"{cap:,} are shown]")
-        out.update(ok=ok, text=text, chars=full, truncated=cap > 0 and full > cap,
+        out.update(ok=ok, text=text, images=images, chars=full, truncated=cap > 0 and full > cap,
                    ms=int((time.monotonic() - t0) * 1000))
         return out
 

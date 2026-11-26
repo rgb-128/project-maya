@@ -229,8 +229,9 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     const bool native_key = w.key_native_data != nullptr && w.key_bf16 == nullptr;
     if (native_key && (!emb || !hidden || !hist_rows || !out.result || !scratch || !stream ||
                        !w.key_native_q8_1 ||
-                       (w.key_native_type != 42 && w.key_native_type != 18 && w.key_native_type != 23)))
-        throw std::invalid_argument("ple_block: native key requires Q2_0, IQ3_XXS or IQ4_XS weights, input/output, private scratch and explicit stream");
+                       (w.key_native_type != 42 && w.key_native_type != 18 && w.key_native_type != 23 &&
+                        w.key_native_type != 8 && w.key_native_type != kGgmlQ8_0_SOA)))
+        throw std::invalid_argument("ple_block: native key requires Q2_0, IQ3_XXS, IQ4_XS, or Q8_0 weights, input/output, private scratch and explicit stream");
     if (emb == nullptr || hidden == nullptr || hist_rows == nullptr || out.result == nullptr) return;
     const int n_embd = NG_N_EMBD, hc = NG_HC, hc_dim = NG_HC_DIM;
     static_assert(NG_N_EMBD == 2560 && NG_HC_DIM == 10240, "native PLE key geometry changed");
@@ -362,6 +363,85 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     // **NO `cudaStreamSynchronize` HERE.**  It was there to make the function self-contained for the parity
     // test, and inside a capture it is an error - a caller that wants the result immediately synchronises
     // itself, and the engine's caller does not want that at all.
+}
+
+void ple_block_batch(int n_tok, const float* emb, float* hidden, float* hist, const PleWeights& w,
+                     float* key_buf, float* val_buf, void* q8_buf, float* hist_snap, void* scratch, void* stream,
+                     float* batch_scratch) {
+    if (n_tok <= 0) return;
+    const int n_embd = NG_N_EMBD, hc = NG_HC, hc_dim = NG_HC_DIM;
+    const size_t HS = (size_t) NG_HIST * hc_dim;
+    const bool native_key = w.key_native_data != nullptr && w.key_bf16 == nullptr;
+    cudaStream_t st = (cudaStream_t) stream;
+    // 1. Batched key projection (reads ple_key weights ONCE for all n_tok tokens!)
+    if (w.key_bf16 != nullptr) {
+        bf16_gemv_fp32_mmvf_multi(emb, n_embd, w.key_bf16, key_buf, hc_dim, n_embd, hc_dim, n_tok, stream);
+    } else if (native_key && q8_buf != nullptr) {
+        native_quantize_q8_1(emb, q8_buf, n_embd, n_tok, stream);
+        native_mmvq(w.key_native_type, w.key_native_data, q8_buf, key_buf, n_embd, hc_dim, n_tok, stream);
+    } else {
+        for (int t = 0; t < n_tok; ++t) {
+            PleOut po;
+            po.normalized = (float*) ((uint8_t*) scratch + ple_block_scratch_bytes());
+            po.result = hidden + (size_t) t * hc_dim;
+            ple_block(emb + (size_t) t * n_embd, hidden + (size_t) t * hc_dim, hist, w, po, scratch, stream);
+            ple_history_advance(hist, po.normalized, stream);
+            if (hist_snap) ck(cudaMemcpyAsync(hist_snap + (size_t) t * HS, hist, HS * sizeof(float), cudaMemcpyDeviceToDevice, st), "hist_snap");
+        }
+        return;
+    }
+    // 2. Batched value projection (reads ple_value weights ONCE for all n_tok tokens!)
+    if (native_bf16) {
+        bf16_gemv_fp32_mmvf_multi(emb, n_embd, w.value_bf16, val_buf, n_embd, n_embd, n_embd, n_tok, stream);
+    } else {
+        for (int t = 0; t < n_tok; ++t) {
+            uint8_t* base = (uint8_t*) scratch;
+            const size_t float_bytes = (size_t) (5 * hc_dim + n_embd + hc) * sizeof(float);
+            const size_t q8_bytes = (size_t) (n_embd / 32) * 34;
+            uint16_t* d_emb16 = (uint16_t*) (base + ((float_bytes + 15) & ~(size_t) 15) + ((q8_bytes + 15) & ~(size_t) 15));
+            to_bf16_kernel<<<(n_embd + THREADS - 1) / THREADS, THREADS, 0, st>>>(emb + (size_t) t * n_embd, d_emb16, n_embd);
+            bf16_gemv_kernel<<<(n_embd + THREADS - 1) / THREADS, THREADS, 0, st>>>(d_emb16, w.value_bf16, val_buf + (size_t) t * n_embd, n_embd, n_embd);
+        }
+    }
+    // 3. Batched postops + history snapshot in 7 launches (replaces n_tok * 8 sequential launches + n_tok D2D memcpys!)
+    if (native_postops && batch_scratch != nullptr) {
+        float* qnorm_b = batch_scratch;
+        float* gated_b = qnorm_b + (size_t) n_tok * hc_dim;
+        float* gate_b  = gated_b + (size_t) n_tok * hc_dim;
+        native_ple_postops_batch(key_buf, hidden, val_buf, hist, w, qnorm_b, gated_b, gate_b, n_tok, stream, hist_snap);
+        return;
+    }
+    // Fallback per-token postops + history advance
+    float* d_scratch = (float*) scratch;
+    float* d_query = d_scratch + hc_dim;
+    float* d_norm = d_query + hc_dim;
+    float* d_gated = d_norm + hc_dim;
+    float* d_conv = d_gated + hc_dim;
+    float* d_value_unused = d_conv + hc_dim;
+    float* d_gate = d_value_unused + n_embd;
+    for (int t = 0; t < n_tok; ++t) {
+        float* ht = hidden + (size_t) t * hc_dim;
+        float* kt = key_buf + (size_t) t * hc_dim;
+        float* vt = val_buf + (size_t) t * n_embd;
+        if (native_postops) {
+            NativePlePostopsBuffers buffers{d_query, d_norm, d_gate, d_gated, d_norm, d_conv, ht};
+            native_ple_postops(kt, ht, vt, hist, w, buffers, stream);
+        } else {
+            gnorm_kernel<<<hc, THREADS, 0, st>>>(kt, w.norm_key, kt, n_embd, NG_RMS_EPS);
+            gnorm_kernel<<<hc, THREADS, 0, st>>>(ht, w.norm_query, d_query, n_embd, NG_RMS_EPS);
+            gate_kernel<<<hc, THREADS, 0, st>>>(kt, d_query, d_gate, n_embd, 1.0f / sqrtf((float) n_embd));
+            bcast_kernel<<<(hc_dim + THREADS - 1) / THREADS, THREADS, 0, st>>>(vt, d_gate, d_gated, n_embd, hc);
+            gnorm_kernel<<<hc, THREADS, 0, st>>>(d_gated, w.norm_conv, d_norm, n_embd, NG_RMS_EPS);
+            conv_kernel<<<(hc_dim + THREADS - 1) / THREADS, THREADS, 0, st>>>(hist, d_norm, w.conv1d_f16, d_conv,
+                                                                             hc_dim, PLE_CONV_KERNEL, NGRAM_SIZE, NG_HIST);
+            add3_kernel<<<(hc_dim + THREADS - 1) / THREADS, THREADS, 0, st>>>(ht, d_gated, d_conv, ht, hc_dim);
+        }
+        ple_history_advance(hist, d_norm, stream);
+        if (hist_snap) {
+            ck(cudaMemcpyAsync(hist_snap + (size_t) t * HS, hist, HS * sizeof(float), cudaMemcpyDeviceToDevice, st), "hist_snap");
+        }
+    }
+    ck(cudaGetLastError(), "ple_block_batch");
 }
 
 }  // namespace strata::kernels

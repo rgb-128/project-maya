@@ -16,6 +16,7 @@
 #include "glm_fast_state.hpp"
 #include "glm_residual.hpp"   // glm-dsa L1-4: the plain residual's embed / head for a window's rows
 #include "strata/core/glm_model.hpp"
+#include "strata/core/glm_p2p.hpp"         // MAYA_GLM_P2P + integrity probe shared with decode hops
 #include "strata/kernels/exl3.hpp"
 #include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 #include "strata/kernels/glm_fast.hpp"
@@ -62,14 +63,6 @@ struct KdaIn {
     float *proj[3], *fa, *ga, *beta;
 };
 
-static bool is_p2p_enabled() {
-    static const bool p2p_env = []() {
-        const char* val = std::getenv("MAYA_GLM_P2P");
-        return val != nullptr && std::atoi(val) != 0;
-    }();
-    return p2p_env;
-}
-
 static std::mutex p2p_mu;
 static float* p2p_slot_buf[16] = {};
 static size_t p2p_slot_bytes[16] = {};
@@ -88,32 +81,8 @@ static void free_p2p_buf(int dev) {
     }
 }
 
-static bool enable_peer_cached(int dst_dev, int src_dev) {
-    if (dst_dev < 0 || dst_dev >= 16 || src_dev < 0 || src_dev >= 16 || dst_dev == src_dev) return false;
-    if (!is_p2p_enabled()) return false;
-    static std::atomic<int> peer_cache[16][16]{};   // 0: unknown, 1: enabled, -1: unsupported
-    int cached = peer_cache[dst_dev][src_dev].load(std::memory_order_acquire);
-    if (cached != 0) return cached > 0;
-    static std::mutex peer_mu;
-    std::lock_guard<std::mutex> lk(peer_mu);
-    cached = peer_cache[dst_dev][src_dev].load(std::memory_order_relaxed);
-    if (cached != 0) return cached > 0;
-    int can_peer = 0;
-    bool ok = false;
-    if (cudaDeviceCanAccessPeer(&can_peer, dst_dev, src_dev) == cudaSuccess && can_peer != 0) {
-        int cur_dev = 0;
-        cudaGetDevice(&cur_dev);
-        cudaSetDevice(dst_dev);
-        const cudaError_t pe = cudaDeviceEnablePeerAccess(src_dev, 0);
-        if (pe != cudaSuccess) (void) cudaGetLastError();
-        ok = (pe == cudaSuccess || pe == cudaErrorPeerAccessAlreadyEnabled);
-        cudaSetDevice(cur_dev);
-    } else {
-        (void) cudaGetLastError();
-    }
-    peer_cache[dst_dev][src_dev].store(ok ? 1 : -1, std::memory_order_release);
-    return ok;
-}
+// Same enable + integrity probe as decode hops (PHB peer can report access but deliver wrong bytes).
+static bool enable_peer_cached(int dst_dev, int src_dev) { return glm_p2p::enable_peer(dst_dev, src_dev); }
 
 KdaIn kda_in(const Glm5Geometry& g, float* base, int tmax, int t) {
     const size_t DI = (size_t) g.d_inner(), T = (size_t) tmax;
@@ -689,10 +658,9 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
                           scr, t0 + T, 8, 0.0f, 0.0f, 0, true,
                           g.arch == GlmArch::GlmDsa ? gf::kRouteNormHf : gf::kRouteNormClamp);   // glm-dsa L1-4 (B5.1)
             ++F->expected;
-            // (every expert in VRAM: the wait and the fetch are no-ops - fast_moe's all_resident, 2 launches a token)
+            // Fuse wait+fetch: one near-empty launch on warm hits (same bits as wait then fetch).
             if (!F->all_resident) {
-                gf::moe_wait(mt, E, s);
-                gf::moe_fetch(mt, g.n_exp_used, Ly.blob, s);
+                gf::moe_wait_fetch(mt, E, g.n_exp_used, Ly.blob, s);
             }
             if (W.uid != nullptr)
                 cudaMemcpyAsync(W.uid + ((size_t) (il - l0_) * kWinMax + t) * 8, mt.plan_id, 8 * sizeof(int),
@@ -846,8 +814,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
                       g.arch == GlmArch::GlmDsa ? gf::kRouteNormHf : gf::kRouteNormClamp);   // glm-dsa L1-4 (B5.1)
         ++F->expected;
         if (!F->all_resident) {
-            gf::moe_wait(md, E, s);
-            gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
+            gf::moe_wait_fetch(md, E, g.n_exp_used, Ly.blob, s);
         }
         if (Ly.exl3) {
             // (fast_moe_experts' EXL3 order: the shared expert's down first, then the routed experts over the F32 input)

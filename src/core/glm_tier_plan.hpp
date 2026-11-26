@@ -140,7 +140,7 @@ inline LanePool lane_pool_mode(int n_parts, bool own_count, const char* shared_e
     if (n_parts < 2) return LanePool::One;
     if (own_count) return LanePool::PerPart;
     if (shared_env != nullptr && shared_env[0] != '\0') {
-        if (dsa && (std::strcmp(shared_env, "socket") == 0 || std::strcmp(shared_env, "2") == 0))
+        if (std::strcmp(shared_env, "socket") == 0 || (dsa && std::strcmp(shared_env, "2") == 0))
             return n_nodes >= 2 ? LanePool::Socket : LanePool::Shared;
         return std::atoi(shared_env) != 0 ? LanePool::Shared : LanePool::PerPart;
     }

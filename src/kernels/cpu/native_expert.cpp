@@ -6,8 +6,17 @@
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx512_one.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/q4k_avx1.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/glm_lane_row4.hpp"   // glm-dsa B14.9: MAYA_GLM_LANE_ROW4 lane hooks
+
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+#endif
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -38,7 +47,8 @@ using RowsFn = void (*)(int, const uint8_t*, size_t, int, const void* const*, in
 // token count of `nts` (the multi-token default 2, 5 and 11 - 11: the kernels' groups of 8 / 4 and their remainders).
 // 306 results: a form off in a few % of them (Q5_K's fused min term under MSVC: ~7%) cannot pass by chance - 39 did
 // in ~6% of starts
-bool rows_match_ggml(RowsFn fn, int type, std::initializer_list<int> nts = {2, 5, 11}, int rows = 17) {
+bool rows_match_ggml(RowsFn fn, int type, std::initializer_list<int> nts = {2, 5, 11}, int rows = 17,
+                     float max_rel_tol = 0.0f) {
     const ggml_type t = (ggml_type) type;
     const ggml_type at = traits(type)->vec_dot_type;
     const int n = 2048;   // eight 256-value blocks
@@ -97,7 +107,14 @@ bool rows_match_ggml(RowsFn fn, int type, std::initializer_list<int> nts = {2, 5
         for (int k = 0; k < nt; ++k)
             for (int r = 0; r < rows; ++r)
                 traits(type)->vec_dot(n, &ref[(size_t) k * rows + r], 0, w.data() + (size_t) r * rb, 0, ap[(size_t) k], 0, 1);
-        if (std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) != 0) return false;
+        if (max_rel_tol == 0.0f) {
+            if (std::memcmp(got.data(), ref.data(), got.size() * sizeof(float)) != 0) return false;
+        } else {
+            for (size_t idx = 0; idx < got.size(); ++idx) {
+                const float denom = std::fmax(1.0f, std::fabs(ref[idx]));
+                if (std::fabs(got[idx] - ref[idx]) > max_rel_tol * denom) return false;
+            }
+        }
     }
     return true;
 }
@@ -121,6 +138,37 @@ RowsFn pick_rows(int type) {
     } else if (avx2 && iq256_supported(type)) {
         fn = iq256_rows;
         set_q5k = iq256_set_q5k_fused;
+    } else if (type == GGML_TYPE_Q4_K && cpu_avx1_f16c_ok()) {
+        const char* q4e = std::getenv("MAYA_GLM_Q4K_AVX1");
+        if (q4e == nullptr || std::atoi(q4e) != 0) {
+            const char* ex = std::getenv("MAYA_GLM_Q4K_AVX1_EXACT");
+            if (ex != nullptr && std::atoi(ex) != 0) {
+                if (rows_match_ggml(q4k_avx1_rows_exact, type)) {
+                    std::fprintf(stderr, "native experts: AVX1+F16C bit-exact multi-token Q4_K active\n");
+                    return q4k_avx1_rows_exact;
+                }
+            } else {
+                if (rows_match_ggml(q4k_avx1_rows_fast, type, {2, 5, 11}, 17, 1e-4f)) {
+                    std::fprintf(stderr, "native experts: AVX1+F16C fast multi-token Q4_K active (MAYA_GLM_Q4K_AVX1=0 disables)\n");
+                    return q4k_avx1_rows_fast;
+                }
+            }
+        }
+    } else if (type == GGML_TYPE_Q5_K && cpu_avx1_f16c_ok()) {
+        if (rows_match_ggml(q5k_avx1_rows, type, {2, 5}, 17, 1e-4f)) {
+            std::fprintf(stderr, "native experts: AVX1+F16C tiled multi-token Q5_K active\n");
+            return q5k_avx1_rows;
+        }
+    } else if (type == GGML_TYPE_Q5_1 && cpu_avx1_f16c_ok()) {
+        if (rows_match_ggml(q51_avx1_rows, type, {2, 5}, 17, 1e-4f)) {
+            std::fprintf(stderr, "native experts: AVX1+F16C tiled multi-token Q5_1 active\n");
+            return q51_avx1_rows;
+        }
+    } else if (type == GGML_TYPE_Q8_0 && cpu_avx1_f16c_ok()) {
+        if (rows_match_ggml(q80_avx1_rows, type, {2, 5}, 17, 1e-4f)) {
+            std::fprintf(stderr, "native experts: AVX1+F16C tiled multi-token Q8_0 active\n");
+            return q80_avx1_rows;
+        }
     }
     if (fn == nullptr) return nullptr;
     if (rows_match_ggml(fn, type)) return fn;
@@ -164,6 +212,37 @@ RowsFn pick_rows1(int type) {
         std::fprintf(stderr, "native experts: the AVX-512 one-token %s rows differ from ggml-cpu's dot in this build - "
                              "not used\n", ggml_type_name((ggml_type) type));
     }
+    if (type == GGML_TYPE_Q4_K && !cpu_avx512_ok() && !cpu_avx2_ok() && cpu_avx1_f16c_ok()) {
+        const char* q4e = std::getenv("MAYA_GLM_Q4K_AVX1_1T");
+        if (q4e == nullptr || std::atoi(q4e) != 0) {
+            init_once();
+            if (rows_match_ggml(q4k_avx1_rows_fast, type, {1}, 64, 1e-4f)) {
+                std::fprintf(stderr, "native experts: AVX1+F16C fast 1-token Q4_K active (MAYA_GLM_Q4K_AVX1_1T=0 disables)\n");
+                return q4k_avx1_rows_fast;
+            }
+        }
+    }
+    if (type == GGML_TYPE_Q5_K && !cpu_avx512_ok() && !cpu_avx2_ok() && cpu_avx1_f16c_ok()) {
+        init_once();
+        if (rows_match_ggml(q5k_avx1_rows, type, {1}, 64, 1e-4f)) {
+            std::fprintf(stderr, "native experts: AVX1+F16C fast 1-token Q5_K active\n");
+            return q5k_avx1_rows;
+        }
+    }
+    if (type == GGML_TYPE_Q5_1 && !cpu_avx512_ok() && !cpu_avx2_ok() && cpu_avx1_f16c_ok()) {
+        init_once();
+        if (rows_match_ggml(q51_avx1_rows, type, {1}, 64, 1e-4f)) {
+            std::fprintf(stderr, "native experts: AVX1+F16C fast 1-token Q5_1 active\n");
+            return q51_avx1_rows;
+        }
+    }
+    if (type == GGML_TYPE_Q8_0 && !cpu_avx512_ok() && !cpu_avx2_ok() && cpu_avx1_f16c_ok()) {
+        init_once();
+        if (rows_match_ggml(q80_avx1_rows, type, {1}, 64, 1e-4f)) {
+            std::fprintf(stderr, "native experts: AVX1+F16C fast 1-token Q8_0 active\n");
+            return q80_avx1_rows;
+        }
+    }
     if (!iq256_rows1_supported(type)) return nullptr;
     init_once();
     if (!cpu_avx2_ok() || std::getenv("MAYA_NO_IQ256") != nullptr) return nullptr;
@@ -187,6 +266,38 @@ RowsFn exact_rows_nt(int type, int nt) { return nt >= 2 ? exact_rows(type) : exa
 }  // namespace
 
 bool native_experts_available() noexcept { return true; }
+
+bool cpu_avx1_f16c_ok() noexcept {
+#if defined(__x86_64__) || defined(_M_X64)
+    static const bool ok = [] {
+        unsigned a = 0, b = 0, c = 0, d = 0;
+#if defined(_MSC_VER)
+        int r[4];
+        __cpuidex(r, 1, 0);
+        a = (unsigned) r[0]; b = (unsigned) r[1]; c = (unsigned) r[2]; d = (unsigned) r[3];
+#else
+        __cpuid_count(1, 0, a, b, c, d);
+#endif
+        (void) a; (void) b; (void) d;
+        // SSSE3 (bit 9), SSE4.1 (bit 19), OSXSAVE (bit 27), AVX (bit 28), F16C (bit 29)
+        const unsigned need = (1u << 9) | (1u << 19) | (1u << 27) | (1u << 28) | (1u << 29);
+        if ((c & need) != need) return false;
+        unsigned xcr0_lo = 0, xcr0_hi = 0;
+#if defined(_MSC_VER)
+        const unsigned long long xcr0 = _xgetbv(0);
+        xcr0_lo = (unsigned) xcr0;
+        (void) xcr0_hi;
+#else
+        __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+        (void) xcr0_hi;
+#endif
+        return (xcr0_lo & 0x6u) == 0x6u;   // XMM + YMM state enabled by OS
+    }();
+    return ok;
+#else
+    return false;
+#endif
+}
 
 bool native_multi_rows_exact(int type) { return exact_rows(type) != nullptr; }
 
@@ -267,6 +378,15 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
+void native_quant_h_info(const NativeFmt& f, int& blck_size, size_t& type_size) {
+    blck_size = (int) ggml_blck_size((ggml_type) f.d_act);
+    type_size = ggml_type_size((ggml_type) f.d_act);
+}
+
+void native_quant_h_range(const NativeFmt& f, const float* h, void* dst, int n_elems) {
+    traits(f.d_act)->from_float(h, dst, n_elems);
+}
+
 namespace {
 // A mixed layer (gate and up of two types, one activation format): the gate rows by their type, the up rows by
 // theirs - each with the exact multi-token rows when this CPU has them (bit for bit ggml-cpu's dot), else
@@ -323,6 +443,18 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         }
         if (avx2) {
             iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+            return;
+        }
+    }
+    // Dispatch AVX1+F16C / exact multi-token & 1-token kernels (Q4_K, Q5_K, etc.) instead of scalar ggml-cpu!
+    if (r1 > r0) {
+        const RowsFn fn = exact_rows_nt(f.gu_type, nt);
+        if (fn == q4k_avx1_rows_fast) {
+            q4k_avx1_gu_swiglu(blob, blob + f.up_off, f.gu_row, (int) f.n_embd, act, nt, ff, r0, r1);
+            return;
+        }
+        if (fn != nullptr) {
+            native_gu_rows_split(f, blob, blob + f.up_off, act, nt, ff, r0, r1);
             return;
         }
     }
@@ -421,12 +553,18 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  MAYA_NO_IQ4NL falls back to it.
 #if defined(__x86_64__) || defined(_M_X64)
-    static const bool iq4nl_mt = std::getenv("MAYA_NO_IQ4NL") == nullptr;
+    // iq4nl256_down_rows is AVX2; gating with cpu_avx2_ok() avoids SIGILL on Ivy Bridge / similar.
+    static const bool iq4nl_mt = std::getenv("MAYA_NO_IQ4NL") == nullptr && cpu_avx2_ok();
 #else
     static const bool iq4nl_mt = false;
 #endif
     if (nt >= 2 && f.d_type == 20 && iq4nl_mt) {
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    // Dispatch AVX1+F16C / exact multi-token & 1-token down kernels (Q5_1, Q8_0, etc.) instead of scalar ggml-cpu!
+    if (r1 > r0 && exact_rows_nt(f.d_type, nt) != nullptr) {
+        native_down_rows_split(f, blob + f.down_off, hq, nt, out, r0, r1);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.d_type)->vec_dot;

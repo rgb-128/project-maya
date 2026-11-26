@@ -19,7 +19,7 @@ void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows,
 
 /// The same into FP16 bits (the prompt path's quantized-weight GEMMs: Q2_0 values are exact in FP16).
 void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
-                 void* stream);
+                 void* stream, int64_t total_rows = 0);
 
 /// The same into FP32 (tests and small tensors).
 void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out, void* stream);

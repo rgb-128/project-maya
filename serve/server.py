@@ -2028,7 +2028,7 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
-    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
+    if len(gpu_list(cfg)) > 1 and "--layer-split" not in args and "--tp" not in args:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     return args
 
@@ -4820,6 +4820,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
     could not reach the model before the client's)."""
     max_rounds = int(hub.settings["max_rounds"])
+    own_names = {t.get("name") for t in (tools or []) if isinstance(t, dict) and t.get("name")} - set(mcp_names)
     total, rounds, done = 0, 0, None
     messages = list(messages)
     while True:
@@ -4830,7 +4831,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                 continue
             if kind == "event":
                 ev: Event = x
-                if ev.call is not None and ev.call.name in mcp_names:
+                if ev.call is not None and (ev.call.name in mcp_names or ev.call.name not in own_names):
                     if ev.kind == "tool_start":          # the model has started writing a call: say so at once
                         yield "mcp", {"event": "start", "id": ev.call.id, "name": ev.call.name}
                     elif ev.kind == "tool_call":
@@ -4883,7 +4884,11 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             r = box["r"]
             print(f"[maya] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            results.append(r["text"])
+            imgs = r.get("images") or []
+            if imgs and svc.vision is not None:
+                results.append([{"type": "text", "text": r["text"]}] + [{"type": "image", "source": s} for s in imgs])
+            else:
+                results.append(r["text"])
             yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
@@ -7241,7 +7246,10 @@ def main() -> int:
             vision = Vision(vcfg, log=vlog, env=venv)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
-            print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
+            if "--tp" in (cfg.get("args") or []):
+                print(f"[maya] TP+EP parallel engine across GPUs {gpu_list(cfg)}", flush=True)
+            else:
+                print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         t0 = time.time()
         mixed = mixed_gpus.config_of(cfg)   # (opt-in: an NVIDIA card beside the AMD GPU runs the first layers)
         if mixed is not None:

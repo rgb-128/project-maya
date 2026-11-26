@@ -96,6 +96,18 @@ static_assert(IQ1S_DELTA == 0.125f && IQ1M_DELTA == 0.125f, "IQ1's delta: the co
 template <int T>
 __host__ __device__ __forceinline__ size_t row_bytes_t(int k) { return (size_t) (k / kQK<T>) * Ty<T>::B; }
 
+// Pascal GP100/GP10x (sm_60/sm_61) 32-bit shared-memory banks suffer 2x bank conflicts on random LDS.64 (uint2)
+// codebook lookups. Splitting uint2 tables into SoA (lo[0..H-1], hi[H..2H-1]) emits 2x LDS.32 with zero bank
+// conflicts and zero extra shared memory, 100% bit-exact across DeepSeek-V4.1-Flash and MiniMax-M3.1-Flash.
+template <int HALF>
+__device__ __forceinline__ uint2 ds4_tab_u2(const uint32_t* tab, uint32_t idx) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 600 || __CUDA_ARCH__ == 610)
+    return make_uint2(tab[idx], tab[HALF + idx]);
+#else
+    return ((const uint2*) tab)[idx];
+#endif
+}
+
 // the type's codebook into shared memory (u32 words; IQ4_XS, IQ4_NL: their 16 values, from bytes - an int8 table's
 // alignment)
 template <int T>
@@ -112,7 +124,21 @@ __device__ __forceinline__ void load_tab(uint32_t* tab) {
                               : T == kIQ3_XXS                 ? (const uint32_t*) iq3xxs_grid
                               : T == kIQ1_S || T == kIQ1_M    ? (const uint32_t*) iq1s_grid_gpu
                                                               : (const uint32_t*) iq3s_grid;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 600 || __CUDA_ARCH__ == 610)
+        if constexpr (T == kIQ2_XXS || T == kIQ2_XS || T == kIQ2_S) {
+            constexpr int HALF = Ty<T>::TAB / 2;
+            const uint2* src2 = (const uint2*) src;
+            for (int i = threadIdx.x; i < HALF; i += blockDim.x) {
+                const uint2 v = src2[i];
+                tab[i] = v.x;
+                tab[HALF + i] = v.y;
+            }
+        } else {
+            for (int i = threadIdx.x; i < Ty<T>::TAB; i += blockDim.x) tab[i] = src[i];
+        }
+#else
         for (int i = threadIdx.x; i < Ty<T>::TAB; i += blockDim.x) tab[i] = src[i];
+#endif
     }
 }
 
@@ -223,7 +249,7 @@ __device__ __forceinline__ void iq1_decode(const Raw1& r, int kb, const uint32_t
 #pragma unroll
         for (int l = 0; l < 4; ++l) {   // group l: index bits 4 l .. 4 l + 2 of h, the delta's sign bit 4 l + 3
             if constexpr (CT) {
-                const uint2 c = ((const uint2*) tab)[iq1m_entry(r.q4, r.h, l)];
+                const uint2 c = ds4_tab_u2<kIq1mCodes>(tab, iq1m_entry(r.q4, r.h, l));
                 s.q[2 * l] = (int) c.x;
                 s.q[2 * l + 1] = (int) c.y;
             } else {
@@ -261,7 +287,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         const uint32_t a0 = ld2(q), a1 = ld2(q + 4);
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint2 g = ((const uint2*) tab)[(a0 >> (8 * l)) & 255u];
+            const uint2 g = ds4_tab_u2<256>(tab, (a0 >> (8 * l)) & 255u);
             const uint32_t sg = ksigns8(a1 >> (7 * l));
             s.q[2 * l] = sgn4(g.x, sg);
             s.q[2 * l + 1] = sgn4(g.y, sg >> 4);
@@ -274,7 +300,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const uint32_t v = *(const uint16_t*) (q + 2 * l);
-            const uint2 g = ((const uint2*) tab)[v & 511u];
+            const uint2 g = ds4_tab_u2<512>(tab, v & 511u);
             const uint32_t sg = ksigns8(v >> 9);
             s.q[2 * l] = sgn4(g.x, sg);
             s.q[2 * l + 1] = sgn4(g.y, sg >> 4);
@@ -287,7 +313,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         const uint32_t i4 = ld2(qs + 4 * ib), sg4 = ld2(qs + 32 + 4 * ib), h = b[66 + ib], sc = b[74 + ib];
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint2 g = ((const uint2*) tab)[((i4 >> (8 * l)) & 255u) | ((h << (8 - 2 * l)) & 0x300u)];
+            const uint2 g = ds4_tab_u2<1024>(tab, ((i4 >> (8 * l)) & 255u) | ((h << (8 - 2 * l)) & 0x300u));
             const uint32_t sg = sg4 >> (8 * l);
             s.q[2 * l] = sgn4(g.x, sg);
             s.q[2 * l + 1] = sgn4(g.y, sg >> 4);
@@ -473,28 +499,38 @@ __device__ __forceinline__ float fma_no_contract(float a, float b, float c) {
 #endif
 }
 
+__device__ __forceinline__ int ds4_dp4a(int a, int b, int c) {
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+    const int8_t* x = reinterpret_cast<const int8_t*>(&a);
+    const int8_t* y = reinterpret_cast<const int8_t*>(&b);
+    return c + int(x[0]) * int(y[0]) + int(x[1]) * int(y[1]) + int(x[2]) * int(y[2]) + int(x[3]) * int(y[3]);
+#else
+    return __dp4a(a, b, c);
+#endif
+}
+
 // the sub-block against 32 int8 activations (xa: values 0..15, xb: 16..31), before their scale: an exact integer dot,
 // its scales in F32 (explicit roundings: every instantiation the same bits)
 template <int T>
 __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int4& xb) {
-    int lo = __dp4a(s.q[0], xa.x, 0);
-    lo = __dp4a(s.q[1], xa.y, lo);
-    lo = __dp4a(s.q[2], xa.z, lo);
-    lo = __dp4a(s.q[3], xa.w, lo);
-    int hi = __dp4a(s.q[4], xb.x, 0);
-    hi = __dp4a(s.q[5], xb.y, hi);
-    hi = __dp4a(s.q[6], xb.z, hi);
-    hi = __dp4a(s.q[7], xb.w, hi);
+    int lo = ds4_dp4a(s.q[0], xa.x, 0);
+    lo = ds4_dp4a(s.q[1], xa.y, lo);
+    lo = ds4_dp4a(s.q[2], xa.z, lo);
+    lo = ds4_dp4a(s.q[3], xa.w, lo);
+    int hi = ds4_dp4a(s.q[4], xb.x, 0);
+    hi = ds4_dp4a(s.q[5], xb.y, hi);
+    hi = ds4_dp4a(s.q[6], xb.z, hi);
+    hi = ds4_dp4a(s.q[7], xb.w, hi);
     float v = fmul_no_fma(s.d, (float) (s.s0 * lo + s.s1 * hi));
     if constexpr (Ty<T>::MIN) {
-        int sl = __dp4a(0x01010101, xa.x, 0);
-        sl = __dp4a(0x01010101, xa.y, sl);
-        sl = __dp4a(0x01010101, xa.z, sl);
-        sl = __dp4a(0x01010101, xa.w, sl);
-        int sh = __dp4a(0x01010101, xb.x, 0);
-        sh = __dp4a(0x01010101, xb.y, sh);
-        sh = __dp4a(0x01010101, xb.z, sh);
-        sh = __dp4a(0x01010101, xb.w, sh);
+        int sl = ds4_dp4a(0x01010101, xa.x, 0);
+        sl = ds4_dp4a(0x01010101, xa.y, sl);
+        sl = ds4_dp4a(0x01010101, xa.z, sl);
+        sl = ds4_dp4a(0x01010101, xa.w, sl);
+        int sh = ds4_dp4a(0x01010101, xb.x, 0);
+        sh = ds4_dp4a(0x01010101, xb.y, sh);
+        sh = ds4_dp4a(0x01010101, xb.z, sh);
+        sh = ds4_dp4a(0x01010101, xb.w, sh);
         v = fsub_no_fma(v, fadd_no_fma(fmul_no_fma(s.m0, (float) sl), fmul_no_fma(s.m1, (float) sh)));
     }
     return v;
@@ -508,7 +544,7 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
     if constexpr (T == kIQ2_XXS) {
         const uint8_t* q = b + 2 + 8 * ib;
         const uint32_t a1 = ld2(q + 4);
-        const uint2 g = ((const uint2*) tab)[q[p]];
+        const uint2 g = ds4_tab_u2<256>(tab, q[p]);
         const uint32_t v = (a1 >> (7 * p)) & 127u, sg = v | ((__popc(v) & 1u) << 7);
         const float dl = h2f(b) * (float) (2 * (int) (a1 >> 28) + 1) * 0.125f;
 #pragma unroll
@@ -518,7 +554,7 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
         }
     } else if constexpr (T == kIQ2_XS) {   // (#357)
         const uint32_t v = *(const uint16_t*) (b + 2 + 8 * ib + 2 * p), sc = b[66 + ib];
-        const uint2 g = ((const uint2*) tab)[v & 511u];
+        const uint2 g = ds4_tab_u2<512>(tab, v & 511u);
         const uint32_t sg = ksigns8(v >> 9);
         const float dl = h2f(b) * (float) (2 * (int) (p < 2 ? sc & 15 : sc >> 4) + 1) * 0.125f;
 #pragma unroll
@@ -530,7 +566,7 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
         const uint8_t* qs = b + 2;
         const uint32_t idx = qs[4 * ib + p] | ((((uint32_t) b[66 + ib]) << (8 - 2 * p)) & 0x300u);
         const uint32_t sg = qs[32 + 4 * ib + p], sc = b[74 + ib];
-        const uint2 g = ((const uint2*) tab)[idx];
+        const uint2 g = ds4_tab_u2<1024>(tab, idx);
         const float dl = h2f(b) * (float) (2 * (int) (p < 2 ? sc & 15 : sc >> 4) + 1) * 0.125f;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
@@ -801,12 +837,21 @@ constexpr int kTabW = CT ? 2 * kIq1mCodes : Ty<T>::TAB > 0 ? Ty<T>::TAB : 1;
 template <int T, bool CT>
 __device__ __forceinline__ void load_tab_k(uint32_t* tab) {
     if constexpr (CT) {   // (entry j: grid entry j mod 2048's codes, the delta's sign j >> 11)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 600 || __CUDA_ARCH__ == 610)
+        for (int j = threadIdx.x; j < kIq1mCodes; j += blockDim.x) {
+            uint32_t lo, hi;
+            iq1m_codes(iq1s_grid_gpu[j & 2047], (uint32_t) j >> 11, lo, hi);
+            tab[j] = lo;
+            tab[kIq1mCodes + j] = hi;
+        }
+#else
         uint2* c = (uint2*) tab;
         for (int j = threadIdx.x; j < kIq1mCodes; j += blockDim.x) {
             uint32_t lo, hi;
             iq1m_codes(iq1s_grid_gpu[j & 2047], (uint32_t) j >> 11, lo, hi);
             c[j] = make_uint2(lo, hi);
         }
+#endif
     } else {
         load_tab<T>(tab);
     }
@@ -1084,6 +1129,8 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     pdl_trigger();
 #if defined(STRATA_USE_HIP) && !DS4_ROCWMMA
     __builtin_trap();   // (a device pass for a card without WMMA: never launched there - tc_ok)
+#elif !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    __trap();           // (sm_60/61 has no Tensor Cores: never launched there - tc_ok)
 #else
 #if defined(STRATA_USE_HIP)
     namespace wm = rocwmma;

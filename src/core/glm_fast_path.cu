@@ -32,6 +32,7 @@
 #include "strata/core/glm_heat_evict.hpp"   // glm-dsa B15.8
 #include "strata/core/glm_warm_seq.hpp"   // glm-dsa B8.1 (warm)
 #include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
+#include "strata/core/glm_p2p.hpp"         // MAYA_GLM_P2P peer residual hops
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -441,8 +442,12 @@ static int cpu_node_now() {
 static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
 #ifdef __linux__
     const char* v = getenv("MAYA_GLM_NUMA");
+    const char* lv = getenv("MAYA_GLM_NUMA_LOCAL");
+    const bool local_bind = (v != nullptr && std::strcmp(v, "bind") == 0);
+    const bool local_req = local_bind || (v != nullptr && std::strcmp(v, "local") == 0) ||
+                           (lv != nullptr && std::atoi(lv) != 0);
     const auto nodes = numa_nodes();
-    if ((v != nullptr && std::atoi(v) == 0) || nodes.size() < 2) return nullptr;
+    if ((!local_req && v != nullptr && std::atoi(v) == 0) || nodes.size() < 2) return nullptr;
     int dev = 0, ok = 0;
     cudaGetDevice(&dev);
     if (cudaDeviceGetAttribute(&ok, cudaDevAttrCanUseHostPointerForRegisteredMem, dev) != cudaSuccess || !ok) {
@@ -451,6 +456,109 @@ static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
     }
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) return nullptr;
+    if (local_req) {
+        const int gnode = gpu_numa_node(dev);
+        const bool gnode_ok = gnode >= 0 && gnode < 256 &&
+                              std::find(nodes.begin(), nodes.end(), gnode) != nodes.end();
+        if (gnode_ok) {
+            // GPU-local NUMA placement: bind GPU `dev`'s RAM-tier arena to its own PCIe root socket (`gnode`) so
+            // PCIe DMA and socket-local CPU lanes never cross QPI/UPI.  Check free 2 MB+ huge pages on `gnode` only.
+            size_t node_huge_free = 0;
+            bool huge_known = false;
+            const std::string tag = "Node " + std::to_string(gnode) + ",";
+            if (FILE* bf = std::fopen("/proc/buddyinfo", "r")) {
+                char line[512];
+                while (std::fgets(line, sizeof line, bf)) {
+                    if (std::strncmp(line, tag.c_str(), tag.size()) != 0) continue;
+                    const char* z = std::strstr(line, "zone");
+                    if (z == nullptr) continue;
+                    z += 4;
+                    while (*z == ' ') ++z;
+                    while (*z != ' ' && *z != '\0') ++z;
+                    unsigned long long c[16] = {};
+                    int k = 0;
+                    char* end = nullptr;
+                    for (const char* q = z; k < 16; ++k, q = end) {
+                        c[k] = std::strtoull(q, &end, 10);
+                        if (end == q) break;
+                    }
+                    for (int o = 9; o < k; ++o) node_huge_free += (size_t) c[o] << (o + 12);
+                    huge_known = true;
+                }
+                std::fclose(bf);
+            }
+            const bool use_hp = !huge_known || node_huge_free >= bytes + ((size_t) 1 << 30);
+            if (use_hp) madvise(p, bytes, MADV_HUGEPAGE);
+            unsigned long lmask[4] = {0, 0, 0, 0};
+            lmask[gnode / 64] = 1ul << (gnode % 64);
+            // Linux MPOL_PREFERRED spills across QPI instead of reclaiming clean file page cache on the local node.
+            // Use MPOL_BIND automatically whenever the local node has enough MemFree + reclaimable file cache + 4 GiB.
+            bool use_bind = local_bind;
+            if (!use_bind) {
+                std::string mi_path = "/sys/devices/system/node/node" + std::to_string(gnode) + "/meminfo";
+                if (FILE* mf = std::fopen(mi_path.c_str(), "r")) {
+                    char line[256];
+                    int64_t mfree = 0, ifile = 0, afile = 0, srecl = 0;
+                    long long kb = 0;
+                    while (std::fgets(line, sizeof line, mf)) {
+                        if (std::sscanf(line, "Node %*d MemFree: %lld kB", &kb) == 1) mfree = kb * 1024;
+                        else if (std::sscanf(line, "Node %*d Inactive(file): %lld kB", &kb) == 1) ifile = kb * 1024;
+                        else if (std::sscanf(line, "Node %*d Active(file): %lld kB", &kb) == 1) afile = kb * 1024;
+                        else if (std::sscanf(line, "Node %*d SReclaimable: %lld kB", &kb) == 1) srecl = kb * 1024;
+                    }
+                    std::fclose(mf);
+                    if (mfree + ifile + afile + srecl >= (int64_t) bytes + ((int64_t) 4 << 30)) use_bind = true;
+                }
+            }
+            const int pol = use_bind ? 2 /* MPOL_BIND */ : 1 /* MPOL_PREFERRED */;
+            if (syscall(SYS_mbind, p, bytes, pol, lmask, (unsigned long) (sizeof lmask * 8), 0u) == 0) {
+                // Fault in with threads pinned to `gnode`'s CPUs over 2 MB-aligned contiguous slices (preserves THP,
+                // avoids QPI traffic during touch, and cuts startup pinning latency 4x).
+                std::vector<int> local_cpus;
+                for (const auto& gr : cpu_groups())
+                    if (gr.first == gnode) { local_cpus = gr.second; break; }
+                const char* ptv = getenv("MAYA_GLM_PIN_THREADS");
+                const int n_ft = std::max(1, std::min(16, ptv != nullptr && ptv[0] != '\0' ? std::atoi(ptv) : 4));
+                const size_t align_2m = (size_t) 2 << 20;
+                const size_t n_chunks = (bytes + align_2m - 1) / align_2m;
+                const int ft = (int) std::min<size_t>((size_t) n_ft, std::max<size_t>(1, n_chunks));
+                const auto touch = [p, bytes, align_2m, n_chunks, ft](int t) {
+                    const size_t c0 = n_chunks * (size_t) t / (size_t) ft;
+                    const size_t c1 = n_chunks * (size_t) (t + 1) / (size_t) ft;
+                    const size_t o0 = std::min(bytes, c0 * align_2m);
+                    const size_t o1 = std::min(bytes, c1 * align_2m);
+                    for (size_t o = o0; o < o1; o += 4096) ((volatile char*) p)[o] = 0;
+                };
+                if (ft > 1) {
+                    std::vector<std::thread> th;
+                    th.reserve((size_t) ft);
+                    for (int t = 0; t < ft; ++t) {
+                        th.emplace_back([&, t] {
+                            if (!local_cpus.empty()) glmfast::pin_thread(pthread_self(), local_cpus);
+                            touch(t);
+                        });
+                    }
+                    for (auto& x : th) x.join();
+                } else {
+                    touch(0);
+                }
+                if (cudaHostRegister(p, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess) {
+                    std::fprintf(stderr, "glm fast: CUDA%d RAM arena %.2f GB GPU-local NUMA node %d (%s, %s, %d fault threads)\n",
+                                 dev, bytes / 1073741824.0, gnode, use_bind ? "MPOL_BIND" : "MPOL_PREFERRED",
+                                 use_hp ? "THP" : "4K", ft);
+                    return p;
+                }
+                cudaGetLastError();
+                munmap(p, bytes);
+                return nullptr;
+            }
+            std::fprintf(stderr, "glm fast: CUDA%d GPU-local NUMA node %d: mbind refused - falling back to interleaved\n",
+                         dev, gnode);
+        } else {
+            std::fprintf(stderr, "glm fast: CUDA%d GPU-local NUMA unavailable (node %d) - falling back to interleaved\n",
+                         dev, gnode);
+        }
+    }
     unsigned long mask[4] = {0, 0, 0, 0};
     for (int n : nodes) mask[n / 64] |= 1ul << (n % 64);
     static const bool halves = getenv("MAYA_GLM_ROW_HALVES") != nullptr && std::atoi(getenv("MAYA_GLM_ROW_HALVES")) != 0;
@@ -1169,8 +1277,10 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->resp_h = (gf::MoeResponse*) hp;
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.resp = dp;
+    // hop_h is read by the next GPU after a D2H: Portable so every device in the split can DMA it
+    // (multi-seq already used Portable; Default was enough on some drivers and wrong on others).
     if (cudaHostAlloc((void**) &F->emb_h, (size_t) E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc((void**) &F->hop_h, glmres::res_hop_bytes(g), cudaHostAllocDefault) != cudaSuccess ||
+        cudaHostAlloc((void**) &F->hop_h, glmres::res_hop_bytes(g), cudaHostAllocPortable) != cudaSuccess ||
         cudaHostAlloc((void**) &F->tok_h, 64, cudaHostAllocDefault) != cudaSuccess) {
         err = "glm fast: pinned staging did not allocate";
         return false;
@@ -1184,7 +1294,9 @@ bool Glm5Model::fast_setup(std::string& err) {
     // the pipelined MTP decode over a split (MAYA_GLM_SPEC_WIN, decode_spec_pipe in glm_mtp.cu): every part gets
     // the verify window's buffers and its own recurrent-state backup (the window commits restore/replay per part),
     // and the NextN block's part also the cache rows' buffers and the draft head; all before the pool takes the card
-    if (!dflash_on_ && g_.nextn > 0) {
+    const char* mtp_env_path = getenv("MAYA_GLM_MTP_GGUF");
+    const bool has_mtp_block = g_.nextn > 0 || mtp_il_ >= 0 || (mtp_env_path != nullptr && mtp_env_path[0] != '\0');
+    if (!dflash_on_ && has_mtp_block) {
         const char* swe = getenv("MAYA_GLM_SPEC_WIN");
         if (swe != nullptr && std::atoi(swe) != 0) {
             if (!win_reserve(err) || !spec_kda_reserve(err)) return false;
@@ -1233,7 +1345,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     // would take them on its first decode step, when the pool holds all but the reserve and the reserve is not all
     // allocatable.  The head group is the parts [0, h) that kda_all walks; h comes from part_/n_parts_ because
     // split_next_ is linked only after every part has loaded.
-    if (!dflash_on_ && g_.nextn > 0 && n_parts_ > 1 && part_ < spec_head_parts(n_parts_, g_.arch == GlmArch::GlmDsa) &&
+    if (!dflash_on_ && has_mtp_block && n_parts_ > 1 && part_ < spec_head_parts(n_parts_, g_.arch == GlmArch::GlmDsa) &&
         !strata::platform::env_switch("MAYA_GLM_NO_MTP") && !strata::platform::env_switch("MAYA_GLM_NO_SPEC") &&
         !spec_kda_reserve(err))
         return false;
@@ -3787,8 +3899,13 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     if (exl3_)   // (fast_cpu_experts' EXL3 rows, per expert)
         F->cpu_x3.assign(8 * X3Rows::floats(g.n_embd, g.n_ff_exp), 0.0f);
     // the service thread is the pool's last worker; idle workers spin 20 ms (a decode's routes come ~1 ms apart)
+    bool socket_pool = false;
     if (glmtier::lane_pools(*F, g, n_parts_, part_, own_count, lv != nullptr, threads, gpu_numa_node(dev_), dev_)) {
         // glm-dsa B8.3 / B8.4: a pinned pool per socket (MAYA_GLM_CPU_SHARED=socket) or the node-split pools
+        socket_pool = true;
+        if (F->cpu_pool != nullptr) threads = F->cpu_pool->active();
+        pin_node = F->cpu_node;
+        pin_cpus = F->cpu_pin;
     } else if (shared) {
         F->cpu_pool = shared_cpu_pool(threads);
     } else {
@@ -4018,7 +4135,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     }
     std::fprintf(stderr, "glm fast: CUDA%d CPU lane: %d threads%s, an expert %.3f ms on the CPU vs %.3f ms over PCIe -> "
                          "of 0..8 RAM-tier experts the CPU takes%s\n", dev_, threads,
-                 shared ? " (one pool, shared by the split's GPUs)"
+                 socket_pool ? (" (socket pool on " + std::to_string(pin_cpus.size()) + " CPUs, NUMA node " +
+                                std::to_string(pin_node) + ")").c_str()
+                 : shared ? " (one pool, shared by the split's GPUs)"
                  : pin_cpus.empty() ? ""
                  : (" on " + std::to_string(pin_cpus.size()) + " CPUs of its own" +
                     (pin_node >= 0 ? " (NUMA node " + std::to_string(pin_node) + ")" : std::string())).c_str(),
@@ -6515,13 +6634,12 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     // fetch as one launch (gf::moe_wait_fetch): a batched step makes these launches once a row and layer, mostly empty
     const bool skip_empty = rows && glmfast::skip_empty_on();
     const bool empty = F->all_resident || (skip_empty && F->layer_resident(il));
-    if (!empty && skip_empty) {
+    // Warm routes (no disk miss, no PCIe fetch) are the common case once the expert cache is hot.
+    // Two empty launches + the gap between them cost ~1–2.5 ms/token on measured packs; fuse into one
+    // near-empty launch (same as MAYA_GLM_SKIP_EMPTY's batched path). Bit-identical: wait then fetch.
+    if (!empty) {
         gf::moe_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s);
-    } else if (!empty) {
-        gf::moe_wait(md, g.n_embd, s);
-        if (F->prof_on) F->mark("moe_wait");
-        gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
-        if (F->prof_on) F->mark("moe_fetch");
+        if (F->prof_on) F->mark("moe_wait_fetch");
     }
     if (pf && pf_at == 1) issue_prefetch();
     // this layer's own prefetched experts (issued one layer ago) must have landed before they are read
@@ -6825,20 +6943,16 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
     glmres::res_embed(g, F->emb, state_, F->cs);   // glm-dsa B2.3 (mHC: gf::embed_streams)
     if (!fast_layers(p, false, err)) return false;
-    // each later part of a split: the residual crosses over through the previous part's pinned hop buffer, the
-    // copy ordered on the devices by an event (the host never waits between the parts)
+    // each later part of a split: residual hop GPU→GPU when MAYA_GLM_P2P=1 and peer access works
+    // (pairs 0-1 / 2-3 on this box), else through the previous part's pinned hop buffer. Host never waits.
     Glm5Model* tail = this;
     for (Glm5Model* B = split_next_.get(); B != nullptr; B = B->split_next_.get()) {
         FastState* FA = tail->fast_;
         FastState* FB = B->fast_;
         const size_t hop = glmres::res_hop_bytes(g);   // glm-dsa B2.3
-        cudaSetDevice(tail->dev_);
-        cudaMemcpyAsync(FA->hop_h, tail->state_, hop, cudaMemcpyDeviceToHost, FA->cs);
-        cudaEventRecord(FA->ev_hop, FA->cs);
-        cudaSetDevice(B->dev_);
         B->pos_ = pos_;
-        cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
-        cudaMemcpyAsync(B->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
+        glm_p2p::hop_residual(tail->dev_, FA->cs, tail->state_, FA->hop_h, FA->ev_hop, B->dev_, FB->cs, B->state_,
+                              hop);
         if (!B->fast_layers(p, true, err)) return false;
         tail = B;
     }
@@ -7405,13 +7519,8 @@ bool Glm5Model::hop_to_next(Glm5Model* B, int64_t p, std::string& err) {
     const size_t hop = glmres::res_hop_bytes(g_);   // glm-dsa B2.3
     FastState* FA = fast_;
     FastState* FB = B->fast_;
-    cudaSetDevice(dev_);
-    cudaMemcpyAsync(FA->hop_h, state_, hop, cudaMemcpyDeviceToHost, FA->cs);
-    cudaEventRecord(FA->ev_hop, FA->cs);
-    cudaSetDevice(B->dev_);
     B->pos_ = p + 1;
-    cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
-    cudaMemcpyAsync(B->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
+    glm_p2p::hop_residual(dev_, FA->cs, state_, FA->hop_h, FA->ev_hop, B->dev_, FB->cs, B->state_, hop);
     return B->fast_layers(p, true, err);
 }
 
@@ -7491,8 +7600,9 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec head sync", err) || !F->route_ok(err)) return false;
     // MAYA_GLM_SPEC_CANCEL: a speculative pass (decode_spec says so) reads the live word before every layer; it is
     // set now, with the stream idle, so no earlier pass reads it any more.  Other passes (a redo, the confirmed token's)
-    // have no gates and never skip.  A head group of one GPU only (decode_spec checks)
-    const bool cancellable = F->spec_cancellable && hl == this && F->spec_live_h != nullptr && F->spec_skip_d != nullptr;
+    // have no gates and never skip.  Supports multi-GPU head groups (SPEC_HEAD >= 1): each head part owns its own
+    // spec_live_h and spec_skip_d, armed right after syncing its own stream.
+    const bool cancellable = F->spec_cancellable && F->spec_live_h != nullptr && F->spec_skip_d != nullptr;
     F->spec_cancellable = false;
     if (cancellable) {
         *(volatile int*) F->spec_live_h = 1;
@@ -7557,7 +7667,19 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
             m->pos_ = p + 1;
             cudaStreamWaitEvent(Fm->cs, prev->spec_ev_hop_[hsl], 0);
             cudaMemcpyAsync(m->state_, prev->spec_hop_h_[hsl], hop, cudaMemcpyHostToDevice, Fm->cs);
-            if (!m->fast_layers(p, true, err)) return false;
+            const bool m_cancel = cancellable && Fm->spec_live_h != nullptr && Fm->spec_skip_d != nullptr;
+            if (m_cancel) {
+                *(volatile int*) Fm->spec_live_h = 1;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                Fm->spec_gate = true;
+                gf::set_skip(Fm->spec_skip_d);
+            }
+            const bool m_ok = m->fast_layers(p, true, err);
+            if (m_cancel) {
+                Fm->spec_gate = false;
+                gf::set_skip(nullptr);
+            }
+            if (!m_ok) return false;
             const int out_sl = (m == hl) ? sl : hsl;
             cudaMemcpyAsync(m->spec_hop_h_[out_sl], m->state_, hop, cudaMemcpyDeviceToHost, Fm->cs);
             cudaEventRecord(m->spec_ev_hop_[out_sl], Fm->cs);
@@ -7640,17 +7762,14 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             Glm5Model* next = m->split_next_.get();
             FastState* FA = m->fast_;
             FastState* FB = next->fast_;
-            cudaSetDevice(m->dev_);
-            cudaMemcpyAsync(FA->hop_h, m->state_, hop, cudaMemcpyDeviceToHost, FA->cs);
-            cudaEventRecord(FA->ev_hop, FA->cs);
             cudaSetDevice(next->dev_);
             if (!glmfast::cuda_ok(cudaStreamSynchronize(FB->cs), "glm spec tail part sync", err) ||
                 !FB->route_ok(err)) return false;
             if (FB->prof_on) FB->collect();
             if (!next->fast_boundary(err)) return false;
             next->pos_ = p + 1;
-            cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
-            cudaMemcpyAsync(next->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
+            glm_p2p::hop_residual(m->dev_, FA->cs, m->state_, FA->hop_h, FA->ev_hop, next->dev_, FB->cs,
+                                  next->state_, hop);
             if (!next->fast_layers(p, true, err)) return false;
         }
         cudaSetDevice(m->dev_);
@@ -7707,13 +7826,13 @@ void Glm5Model::spec_dev_take() {
     }
 }
 
-// hop_to_next in its two halves (the same calls in the same order): this part's residual into its pinned hop_h ...
+// hop_to_next in its two halves: peer hop when MAYA_GLM_P2P works, else pinned hop_h ...
 void Glm5Model::spec_hop_out(bool prof) {
     FastState* FA = fast_;
-    cudaSetDevice(dev_);
-    cudaMemcpyAsync(FA->hop_h, state_, glmres::res_hop_bytes(g_), cudaMemcpyDeviceToHost, FA->cs);   // glm-dsa B2.3
-    cudaEventRecord(FA->ev_hop, FA->cs);
+    const int dst = split_next_ ? split_next_->dev_ : -1;
+    glm_p2p::hop_out(dev_, FA->cs, state_, FA->hop_h, FA->ev_hop, glmres::res_hop_bytes(g_), dst);
     if (prof) {
+        cudaSetDevice(dev_);
         cudaEventRecord(spec_ev_[1], FA->cs);
         spec_ev_live_ = true;
     }
@@ -7722,11 +7841,15 @@ void Glm5Model::spec_hop_out(bool prof) {
 // ... and this part (the one after A) waits for it on the device, copies it in and runs its layers at p
 bool Glm5Model::spec_hop_in(Glm5Model* A, int64_t p, bool prof, std::string& err) {
     FastState* FB = fast_;
-    cudaSetDevice(dev_);
     pos_ = p + 1;
-    cudaStreamWaitEvent(FB->cs, A->fast_->ev_hop, 0);
-    if (prof) cudaEventRecord(spec_ev_[0], FB->cs);
-    cudaMemcpyAsync(state_, A->fast_->hop_h, glmres::res_hop_bytes(g_), cudaMemcpyHostToDevice, FB->cs);   // glm-dsa B2.3
+    cudaSetDevice(dev_);
+    if (prof) {
+        cudaStreamWaitEvent(FB->cs, A->fast_->ev_hop, 0);
+        cudaEventRecord(spec_ev_[0], FB->cs);
+        // hop_in also waits; second wait on same event is a no-op once recorded
+    }
+    glm_p2p::hop_in(dev_, FB->cs, state_, A->dev_, A->state_, A->fast_->hop_h, A->fast_->ev_hop,
+                    glmres::res_hop_bytes(g_));
     return fast_layers(p, true, err);
 }
 
@@ -7848,42 +7971,53 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     cudaSetDevice(dev_);
     // MAYA_GLM_SPEC_CANCEL=1 (opt-in): a wrong draft stops the head's speculative pass at its next layer (spec_head
     // arms a skip_gate before each of its layers) and the redo is enqueued at once, before the next draft - instead of
-    // after the rest of a pass already known to be thrown away.  Only a head group of one GPU (two-GPU splits).
+    // after the rest of a pass already known to be thrown away.  Works for any head group size (SPEC_HEAD >= 1).
     static const bool cancel_env = [] {
         const char* v = getenv("MAYA_GLM_SPEC_CANCEL");
         return v != nullptr && std::atoi(v) != 0;
     }();
-    bool cancel = cancel_env && hl == this;
-    if (cancel && (fast_->spec_live_h == nullptr || fast_->spec_skip_d == nullptr)) {
+    bool cancel = cancel_env;
+    if (cancel) {
+        for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
+            FastState* Fm = m->fast_;
+            if (Fm->spec_live_h != nullptr && Fm->spec_skip_d != nullptr) continue;
+            cudaSetDevice(m->dev_);
+            if (Fm->spec_live_h == nullptr) {
+                int* h = nullptr;
+                if (cudaHostAlloc((void**) &h, 64, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
+                    h[0] = 1;
+                    Fm->spec_live_h = h;
+                } else {
+                    cudaGetLastError();
+                }
+            }
+            if (Fm->spec_skip_d == nullptr) {
+                if (cudaMalloc((void**) &Fm->spec_skip_d, sizeof(int)) == cudaSuccess) {
+                    cudaMemsetAsync(Fm->spec_skip_d, 0, sizeof(int), Fm->cs);
+                } else {
+                    cudaGetLastError();
+                    Fm->spec_skip_d = nullptr;
+                }
+            }
+            if (Fm->spec_live_h == nullptr || Fm->spec_skip_d == nullptr) {
+                std::fprintf(stderr, "glm spec: MAYA_GLM_SPEC_CANCEL - its buffers did not allocate; decoding without it\n");
+                cancel = false;
+                break;
+            }
+        }
         cudaSetDevice(dev_);
-        if (fast_->spec_live_h == nullptr) {
-            int* h = nullptr;
-            if (cudaHostAlloc((void**) &h, 64, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
-                h[0] = 1;
-                fast_->spec_live_h = h;
-            } else {
-                cudaGetLastError();
-            }
-        }
-        if (fast_->spec_skip_d == nullptr) {
-            if (cudaMalloc((void**) &fast_->spec_skip_d, sizeof(int)) == cudaSuccess) {
-                cudaMemsetAsync(fast_->spec_skip_d, 0, sizeof(int), fast_->cs);
-            } else {
-                cudaGetLastError();
-                fast_->spec_skip_d = nullptr;
-            }
-        }
-        if (fast_->spec_live_h == nullptr || fast_->spec_skip_d == nullptr) {
-            std::fprintf(stderr, "glm spec: MAYA_GLM_SPEC_CANCEL - its buffers did not allocate; decoding without it\n");
-            cancel = false;
-        }
     }
+    const auto cancel_head_now = [&]() {
+        for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get())
+            if (m->fast_->spec_live_h != nullptr) *(volatile int*) m->fast_->spec_live_h = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    };
     static bool cancel_said = false;
     if (cancel_env && !cancel_said) {
         cancel_said = true;
         std::fprintf(stderr, "glm spec: %s\n", cancel ? "a wrong draft cancels the head's speculative pass at its next layer "
                                                         "(MAYA_GLM_SPEC_CANCEL)"
-                                                      : "MAYA_GLM_SPEC_CANCEL needs a head group of one GPU - not used");
+                                                      : "MAYA_GLM_SPEC_CANCEL - not used");
     }
     // the head group's recurrent-state backups (each part on its own device and stream)
     const auto kda_all = [&](bool restore) -> bool {
@@ -8060,8 +8194,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             // two GPUs (#860): v1.1.51's round.  (MAYA_GLM_SPEC_CANCEL) a wrong draft: the head's speculative pass
             // for q+2 stops at its next layer, its states are restored behind it and the redo goes in now
             if (cancel && wrong) {
-                *(volatile int*) fast_->spec_live_h = 0;
-                std::atomic_thread_fence(std::memory_order_seq_cst);
+                cancel_head_now();
                 kda_all(true);
                 if (!spec_head(q + 2, y2, err)) { ok = false; break; }
                 lap(2);
@@ -8092,8 +8225,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             // the head redoes q+2 while the tail drafts)
             if (wrong) {
                 if (cancel) {
-                    *(volatile int*) fast_->spec_live_h = 0;
-                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    cancel_head_now();
                     kda_all(true);
                 } else {
                     kda_all(true);

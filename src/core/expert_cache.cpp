@@ -1,5 +1,7 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
 #if !defined(STRATA_USE_HIP)
@@ -472,6 +474,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         layer_slot_range(l, lo, hi);
         layer_next_[(size_t) l] = (int32_t) lo;
     }
+    slot_layer_.assign((size_t) slots_, -1);
     return true;
 }
 
@@ -497,6 +500,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     }
 #endif
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    slot_layer_.assign((size_t) slots_, -1);
     return true;
 }
 
@@ -506,6 +510,12 @@ void ExpertCache::close() {
     blocking_staging_ = nullptr;
     blocking_staging_bytes_ = 0;
 #endif
+    if (repack_scratch_ != nullptr) {
+        cudaFree(repack_scratch_);
+        repack_scratch_ = nullptr;
+    }
+    soa_repacked_ = false;
+    slot_layer_.clear();
     off_.clear();
     if (base_ != nullptr && arena_.ok()) {
         arena_.close();
@@ -553,12 +563,55 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
         layer_slot_range(layer, lo, hi);
         if ((int64_t) layer_next_[(size_t) layer] >= hi) return kNotResident;   // this layer's quota is full
         residency_[at] = layer_next_[(size_t) layer]++;
+        if ((size_t) residency_[at] < slot_layer_.size()) slot_layer_[(size_t) residency_[at]] = (int16_t) layer;
         ++admitted_;
         return residency_[at];
     }
     if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
-    residency_[at] = (int32_t) next_free_;
-    return (int32_t) next_free_++;
+    const int32_t s = (int32_t) next_free_++;
+    residency_[at] = s;
+    if ((size_t) s < slot_layer_.size()) slot_layer_[(size_t) s] = (int16_t) layer;
+    return s;
+}
+
+void ExpertCache::repack_slot_on_stream(int32_t slot, void* stream) {
+    if (!soa_repacked_ || repack_scratch_ == nullptr) return;
+    if (slot < 0 || (size_t) slot >= slot_layer_.size()) return;
+    const int layer = (int) slot_layer_[(size_t) slot];
+    if (layer < 0) return;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || (size_t) layer >= lay.fmt.size()) return;
+    const auto& f = lay.fmt[(size_t) layer];
+    const auto L = strata::kernels::native_expert_layout(f.gu_type, f.u_type, f.d_type, f.n_embd, f.n_ff);
+    if (!strata::kernels::iq_expert_soa_eligible(L)) return;
+    uint8_t* dst = device_slot(slot);
+    if (dst == nullptr) return;
+    strata::kernels::iq_repack_expert_blob_soa(L, dst, repack_scratch_, stream);
+}
+
+bool ExpertCache::enable_soa_repack(std::string& err) {
+    if (soa_repacked_) return true;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || base_ == nullptr || blob_ <= 0) return true;
+    if (repack_scratch_ == nullptr) {
+        const cudaError_t e = cudaMalloc((void**) &repack_scratch_, (size_t) blob_);
+        if (e != cudaSuccess) {
+            err = std::string("ExpertCache::enable_soa_repack: cudaMalloc scratch: ") + cudaGetErrorString(e);
+            return false;
+        }
+    }
+    soa_repacked_ = true;
+    for (int32_t s = 0; s < (int32_t) slots_; ++s) {
+        if ((size_t) s < slot_layer_.size() && slot_layer_[(size_t) s] >= 0) {
+            repack_slot_on_stream(s, (void*) 0);
+        }
+    }
+    const cudaError_t se = cudaStreamSynchronize((cudaStream_t) 0);
+    if (se != cudaSuccess) {
+        err = std::string("ExpertCache::enable_soa_repack: sync: ") + cudaGetErrorString(se);
+        return false;
+    }
+    return true;
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
@@ -591,6 +644,7 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
         return false;
     }
+    if (soa_repacked_) repack_slot_on_stream(slot, stream);
     ++fills_;
     return true;
 }
@@ -622,6 +676,14 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
         return false;
     }
+    if (soa_repacked_) {
+        repack_slot_on_stream(slot, (void*) 0);
+        const cudaError_t se = cudaStreamSynchronize((cudaStream_t) 0);
+        if (se != cudaSuccess) {
+            err = std::string("ExpertCache::fill_slot_blocking: repack sync: ") + cudaGetErrorString(se);
+            return false;
+        }
+    }
     ++fills_;
     return true;
 }
@@ -639,6 +701,7 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
         err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
         return false;
     }
+    if (soa_repacked_) repack_slot_on_stream(slot, (void*) 0);
     ++fills_;
     return true;
 }

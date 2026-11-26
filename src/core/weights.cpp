@@ -118,6 +118,24 @@ bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::st
     return true;
 }
 
+bool WeightTable::skip_outside_layers(const std::string& pack_dir, int lb, int le,
+                                      std::set<std::string>& skip, std::string& err) {
+    const std::string path = pack_dir + "/index.txt";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open " + path; return false; }
+    char line[1024];
+    while (std::fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        char name[256] = {0};
+        if (std::sscanf(line, "%255s", name) != 1) continue;
+        if (std::strncmp(name, "blk.", 4) != 0) continue;
+        const int l = std::atoi(name + 4);
+        if (l < lb || l >= le) skip.insert(name);
+    }
+    std::fclose(f);
+    return true;
+}
+
 bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t arena_bytes, std::string& err,
                        const std::set<std::string>* skip) {
     const std::string path = pack_dir + "/index.txt";
@@ -451,6 +469,124 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
 const WeightRef* WeightTable::find(const std::string& name) const {
     const auto it = table_.find(name);
     return it == table_.end() ? nullptr : &it->second;
+}
+
+WeightTable::~WeightTable() {
+    if (tp_arena_) {
+        int saved = -1;
+        cudaGetDevice(&saved);
+        if (tp_arena_dev_ >= 0) cudaSetDevice(tp_arena_dev_);
+        cudaFree(tp_arena_);
+        if (saved >= 0) cudaSetDevice(saved);
+        tp_arena_ = nullptr;
+    }
+}
+
+bool WeightTable::shard_for_tp(int tp_rank, int tp_size, int64_t S, int64_t HK, int64_t HV, std::string& err) {
+    if (tp_size <= 1) return true;
+    if (tp_rank < 0 || tp_rank >= tp_size || HK % tp_size != 0 || HV % tp_size != 0 || HV % HK != 0) {
+        err = "WeightTable::shard_for_tp: incompatible TP geometry";
+        return false;
+    }
+    const int64_t hk_l = HK / tp_size;
+    const int64_t hv_l = HV / tp_size;
+    const int64_t gqa = HV / HK;
+    // Build modulo-paired V-head indices: {g * HK + tp_rank * hk_l + j} so local head % hk_l == original head % HK!
+    std::vector<int64_t> v_heads;
+    v_heads.reserve((size_t) hv_l);
+    for (int64_t g = 0; g < gqa; ++g)
+        for (int64_t j = 0; j < hk_l; ++j)
+            v_heads.push_back(g * HK + (int64_t) tp_rank * hk_l + j);
+
+    struct SliceJob {
+        WeightRef* ref;
+        std::vector<uint8_t> bytes;
+        int64_t new_ne0, new_ne1;
+    };
+    std::vector<SliceJob> jobs;
+    std::vector<uint8_t> tmp;
+    uint64_t total_bytes = 0;
+    for (auto& [name, wr] : table_) {
+        if (!wr.data || !wr.resident) continue;
+        const bool is_conv = name.ends_with(".ssm_conv1d.weight");
+        const bool is_ab = name.ends_with(".ssm_alpha.weight") || name.ends_with(".ssm_beta.weight");
+        const bool is_vec = name.ends_with(".ssm_dt.bias") || name.ends_with(".ssm_a");
+        if (!is_conv && !is_ab && !is_vec) continue;
+
+        tmp.resize((size_t) wr.bytes);
+        if (cudaMemcpy(tmp.data(), wr.data, (size_t) wr.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = "WeightTable::shard_for_tp: D2H copy failed for " + name;
+            return false;
+        }
+        SliceJob job;
+        job.ref = &wr;
+        if (is_conv) {
+            // ne0 = d_conv (4), ne1 = C (10240), 4 bytes per element -> 16 bytes per channel
+            const size_t ch_b = (size_t) wr.ne0 * 4;
+            const int64_t new_c = (2 * hk_l + hv_l) * S;
+            job.bytes.resize((size_t) new_c * ch_b);
+            uint8_t* dst = job.bytes.data();
+            // Q slice
+            std::memcpy(dst, tmp.data() + (size_t) ((int64_t) tp_rank * hk_l * S) * ch_b, (size_t) (hk_l * S) * ch_b);
+            dst += (size_t) (hk_l * S) * ch_b;
+            // K slice
+            std::memcpy(dst, tmp.data() + (size_t) ((HK + (int64_t) tp_rank * hk_l) * S) * ch_b, (size_t) (hk_l * S) * ch_b);
+            dst += (size_t) (hk_l * S) * ch_b;
+            // Interleaved V slice
+            for (int64_t vh : v_heads) {
+                std::memcpy(dst, tmp.data() + (size_t) ((2 * HK + vh) * S) * ch_b, (size_t) S * ch_b);
+                dst += (size_t) S * ch_b;
+            }
+            job.new_ne0 = wr.ne0;
+            job.new_ne1 = new_c;
+        } else if (is_ab) {
+            // BF16 (2 bytes/elem) or F32 (4 bytes/elem), ne0 = n_embd, ne1 = HV
+            const size_t row_b = (size_t) (wr.bytes / (uint64_t) wr.ne1);
+            job.bytes.resize((size_t) hv_l * row_b);
+            uint8_t* dst = job.bytes.data();
+            for (int64_t vh : v_heads) {
+                std::memcpy(dst, tmp.data() + (size_t) vh * row_b, row_b);
+                dst += row_b;
+            }
+            job.new_ne0 = wr.ne0;
+            job.new_ne1 = hv_l;
+        } else {
+            // 1D F32 (ne0 = HV)
+            const size_t elem_b = 4;
+            job.bytes.resize((size_t) hv_l * elem_b);
+            uint8_t* dst = job.bytes.data();
+            for (int64_t vh : v_heads) {
+                std::memcpy(dst, tmp.data() + (size_t) vh * elem_b, elem_b);
+                dst += elem_b;
+            }
+            job.new_ne0 = hv_l;
+            job.new_ne1 = wr.ne1;
+        }
+        total_bytes += (job.bytes.size() + 255ull) & ~255ull;
+        jobs.push_back(std::move(job));
+    }
+    if (jobs.empty()) return true;
+    if (tp_arena_) { cudaFree(tp_arena_); tp_arena_ = nullptr; }
+    cudaGetDevice(&tp_arena_dev_);
+    if (cudaMalloc(&tp_arena_, total_bytes) != cudaSuccess) {
+        err = "WeightTable::shard_for_tp: cudaMalloc failed";
+        return false;
+    }
+    uint64_t off = 0;
+    for (auto& j : jobs) {
+        uint8_t* dst = (uint8_t*) tp_arena_ + off;
+        if (cudaMemcpy(dst, j.bytes.data(), j.bytes.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "WeightTable::shard_for_tp: H2D upload failed";
+            return false;
+        }
+        j.ref->data = dst;
+        j.ref->bytes = j.bytes.size();
+        j.ref->ne0 = j.new_ne0;
+        j.ref->ne1 = j.new_ne1;
+        j.ref->elements = j.new_ne0 * (j.new_ne1 > 0 ? j.new_ne1 : 1);
+        off += (j.bytes.size() + 255ull) & ~255ull;
+    }
+    return cudaDeviceSynchronize() == cudaSuccess;
 }
 
 }  // namespace strata::core

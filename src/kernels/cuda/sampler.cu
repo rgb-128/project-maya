@@ -129,9 +129,22 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
     // elements contributes nothing rather than contributing a bogus zero.
     float bv = __int_as_float(0xff800000);   // -inf
     int best = n_vocab;
-    for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-        const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
-        if (s > bv) { bv = s; best = v; }
+    if (!use_bits && p.logit_bias == nullptr && (n_vocab & 3) == 0 && (reinterpret_cast<uintptr_t>(l) & 15) == 0) {
+        const float4* l4 = reinterpret_cast<const float4*>(l);
+        const int n4 = n_vocab >> 2;
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            const float4 v4 = __ldg(l4 + i);
+            const int base = i << 2;
+            if (v4.x > bv) { bv = v4.x; best = base + 0; }
+            if (v4.y > bv) { bv = v4.y; best = base + 1; }
+            if (v4.z > bv) { bv = v4.z; best = base + 2; }
+            if (v4.w > bv) { bv = v4.w; best = base + 3; }
+        }
+    } else {
+        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+            const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
+            if (s > bv) { bv = s; best = v; }
+        }
     }
     for (int off = 16; off > 0; off >>= 1) {
         const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);

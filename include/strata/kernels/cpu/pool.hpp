@@ -56,6 +56,7 @@ struct ExpertJob {
 /// is bitwise the single-token job's.
 struct ExpertJobMulti {
     const uint8_t* blob = nullptr;
+    const uint8_t* blob_n1 = nullptr;   ///< optional Node 1 mirrored blob (0-QPI for Socket 1 CPU workers!)
     int nt = 0;
     const ActQ* act[MAXT] = {};
     float* out[MAXT] = {};
@@ -127,7 +128,10 @@ public:
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
-    void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, int layer_hint = -1);
+    /// Parallel native activation quantization across the lock-free pool (cuts multi-token actq ~5x!).
+    void quant_acts_native(const NativeFmt& f, const float* x_f, int64_t H, uint32_t tok_mask, int n_tok,
+                           uint8_t* dst_base, size_t stride_bytes);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -158,7 +162,10 @@ public:
     /// between requests: with most experts in VRAM (a 24 GB card) many layers have no CPU work, so the workers
     /// also sleep mid-request - which the claim protocol above must survive (issue #29).
     /// `MAYA_POOL_SPIN_US` overrides it (a test knob: a short spin makes the workers sleep constantly).
-    static constexpr std::chrono::milliseconds kSpinBeforeSleep{20};
+    // Keep workers awake across an entire 256K decode window + MTP draft (~20-80 ms) so 95%+ VRAM-hit
+    // turns never trigger a 23-thread sleep_cv_/sleep_mu_ thundering herd mid-window; still sleeps to 0% CPU
+    // 150 ms after a request finishes.
+    static constexpr std::chrono::milliseconds kSpinBeforeSleep{150};
     /// A pool wait that sees no completion for this long is a bug; the engine stops with a message instead of
     /// spinning forever, and the server starts it again (issue #29).
     static constexpr std::chrono::seconds kStall{60};
@@ -167,6 +174,8 @@ private:
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
+    void run_fast_slice(int rank, int n_part, int worker_node = 0);
+    void run_fast_phase(int mode, int target_node);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
@@ -212,6 +221,29 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
+    // Zero-RMW Lock-Free Static-Slice Barrier + Per-NUMA-Node Epoch Channels:
+    // Each NUMA node spins on its own cache line (zero cross-QPI invalidation when NUMA-local!), and each worker
+    // publishes completion to its own private 64-byte cache line (zero parked_/head_/done_ atomic contention!).
+    struct alignas(64) NodeEpoch { std::atomic<uint32_t> val{0}; };
+    struct alignas(64) WorkerDone { std::atomic<uint32_t> val{0}; };
+    NodeEpoch fast_epoch_[2];
+    std::unique_ptr<WorkerDone[]> wdone_;
+    std::vector<int> w_node_;               // NUMA node (0 or 1) per worker
+    std::vector<int> node_workers_[2];      // worker ids belonging to NUMA node 0 / node 1
+    std::vector<int> fast_rank_all_;        // static rank in all-cores mode
+    std::vector<int> fast_rank_node_;       // static rank in NUMA-local mode
+    int fast_mode_ = 0;                     // 5 = gu, 6 = down, 7 = quant_h
+    int fast_n_part_ = 1;                   // total participants in active fast phase
+    bool fast_use_numa_ = false;            // active fast phase uses fast_rank_node_ vs fast_rank_all_
+    int fast_nb_ = 0;                       // active batch expert count (for mode 7 quant_h)
+    int n_numa_nodes_ = 1;
+    // Mode 8: parallel native_quant_act state
+    const float* actq_x_ = nullptr;
+    uint8_t* actq_dst_ = nullptr;
+    size_t actq_stride_ = 0;
+    int64_t actq_H_ = 0;
+    int actq_toks_[MAXT] = {};
+    int actq_n_ = 0;
     // The sleep after `kSpinBeforeSleep`.  `sleepers_` is how `publish` knows whether anyone needs waking, so the
     // token path pays one uncontended load per publish and never takes the mutex while the workers spin.
     alignas(64) std::atomic<uint32_t> sleepers_{0};

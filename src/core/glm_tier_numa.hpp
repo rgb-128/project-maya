@@ -61,6 +61,7 @@ struct NodeLane {
     void wait();                                     ///< until it returned
     int node;
     std::vector<int> cpus;
+    std::vector<int> svc_cpus;                       ///< dedicated core(s) for GPU service thread(s) off worker cores
     std::shared_ptr<glmfast::Workers> pool;          ///< threads - 1 workers (the driver is the last)
   private:
     void loop();

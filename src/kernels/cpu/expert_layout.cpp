@@ -3,6 +3,7 @@
 
 #include "strata/platform/cpu_relax.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #if defined(_MSC_VER)
@@ -141,11 +142,41 @@ void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* co
     else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
+// Scalar Q8_1 activation quant (bit-identical to the AVX2/AVX-512 forms). Used on pre-AVX2 x86
+// (Ivy Bridge Xeon etc.) so a Qwen native pack with Q2_0 downs can still run when a few experts
+// fall to the CPU lane; prefer MAYA_GLM_CPU_LANE=0 + full cudaHostRegister so this stays cold.
+static void act_quant_q8_1_scalar(const float* x, int n, ActQ& a) {
+    a.nchunks = n / QKA;
+    for (int k = 0; k < a.nchunks; ++k) {
+        const float* xb = x + k * QKA;
+        float amax = 0.f;
+        for (int j = 0; j < QKA; ++j) amax = std::fmax(amax, std::fabs(xb[j]));
+        const float s = amax > 0.f ? amax / 127.f : 0.f;
+        const float inv = s > 0.f ? 1.f / s : 0.f;
+        int32_t sum = 0;
+        int8_t* q = a.q + k * QKA;
+        for (int j = 0; j < QKA; ++j) {
+            const float t = xb[j] * inv;
+            const float r = t + (t >= 0.f ? 0.5f : -0.5f);
+            int v = (int) r;
+            v = v < -127 ? -127 : (v > 127 ? 127 : v);
+            q[j] = (int8_t) v;
+            sum += v;
+        }
+        a.scale[k] = s;
+        a.sum[k] = sum;
+        a.hx[k] = s * (float) sum;
+    }
+}
+
 void act_quant_any(const float* x, int n, ActQ& a) {
-    if (!q2_own_kernels()) no_simd_kernel("the Q8_1 activation quantizer");
+    if (!q2_own_kernels()) {
+        act_quant_q8_1_scalar(x, n, a);
+        return;
+    }
     if (cpu_avx512_ok()) act_quant_q8_1(x, n, a);
-    else if (!cpu_avx2_ok()) no_simd_kernel("the Q8_1 activation quantizer");
-    else act_quant_q8_1_avx2(x, n, a);
+    else if (cpu_avx2_ok()) act_quant_q8_1_avx2(x, n, a);
+    else act_quant_q8_1_scalar(x, n, a);
 }
 
 #if !defined(STRATA_NATIVE_EXPERTS)
@@ -158,6 +189,8 @@ bool native_fmt_mixed(int, int, int, int64_t, int64_t, NativeFmt&, std::string& 
 }
 void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
+void native_quant_h_info(const NativeFmt&, int&, size_t&) { std::abort(); }
+void native_quant_h_range(const NativeFmt&, const float*, void*, int) { std::abort(); }
 void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif
@@ -227,10 +260,16 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             L.gguf_off[(size_t) (3 * l)] = go;
             L.gguf_off[(size_t) (3 * l + 1)] = uo;
             L.gguf_off[(size_t) (3 * l + 2)] = dox;
-            std::string file;             // v3: the shard that holds this layer (a file name beside --native)
-            if (ss >> file) {
+            std::string f0, f1, f2;       // v3: one shard per layer; v4: gate_shard up_shard down_shard
+            if (ss >> f0) {
                 if (L.gguf_file.empty()) L.gguf_file.assign((size_t) n_layers, std::string());
-                L.gguf_file[(size_t) l] = file;
+                L.gguf_file[(size_t) l] = f0;
+                if (ss >> f1 >> f2) {
+                    if (L.gguf_role_file.empty()) L.gguf_role_file.assign((size_t) (3 * n_layers), std::string());
+                    L.gguf_role_file[(size_t) (3 * l + 0)] = f0;
+                    L.gguf_role_file[(size_t) (3 * l + 1)] = f1;
+                    L.gguf_role_file[(size_t) (3 * l + 2)] = f2;
+                }
             }
         }
         L.fmt[(size_t) l] = f;

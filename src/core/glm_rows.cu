@@ -30,6 +30,7 @@
 #include "glm_rows_state.hpp"
 
 #include "strata/core/mtp_rows.hpp"
+#include "strata/core/glm_p2p.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -743,12 +744,8 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) i * W.sh_hq_s, false, 0, no_bias, lane, i, n, 1);
         ++F->expected;
         if (empty) continue;
-        if (skip_empty) {
-            gf::moe_wait_fetch(m, E, K, Ly.blob, s);
-        } else {
-            gf::moe_wait(m, E, s);
-            gf::moe_fetch(m, K, Ly.blob, s);
-        }
+        // Warm hits: one near-empty launch (same bits as wait then fetch).
+        gf::moe_wait_fetch(m, E, K, Ly.blob, s);
     }
     const float* sh_out = nullptr;
     if (Ly.sh_down.q != nullptr) {
@@ -967,17 +964,10 @@ bool Glm5Model::multi_issue_rows(const int* seqs, const int32_t* tokens,
                       std::to_string(B->dev_);
                 return false;
             }
-        cudaSetDevice(tail->dev_);
         for (int i = 0; i < n; ++i) {
             SeqCtx& ca = tail->seq_[(size_t) seqs[i]];
-            cudaMemcpyAsync(ca.hop_h, cur[i].state, hop, cudaMemcpyDeviceToHost, tail->fast_->cs);
-            cudaEventRecord(ca.ev_hop, tail->fast_->cs);
-        }
-        cudaSetDevice(B->dev_);
-        for (int i = 0; i < n; ++i) {
-            SeqCtx& ca = tail->seq_[(size_t) seqs[i]];
-            cudaStreamWaitEvent(B->fast_->cs, ca.ev_hop, 0);
-            cudaMemcpyAsync(nxt[i].state, ca.hop_h, hop, cudaMemcpyHostToDevice, B->fast_->cs);
+            glm_p2p::hop_residual(tail->dev_, tail->fast_->cs, cur[i].state, ca.hop_h, ca.ev_hop, B->dev_,
+                                  B->fast_->cs, nxt[i].state, hop);
         }
         if (!B->rows_layers(nxt, n, err)) return false;
         for (int i = 0; i < n; ++i) cur[i] = nxt[i];

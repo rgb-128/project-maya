@@ -1,5 +1,17 @@
 <p align="center">English | <a href="README.ja.md">日本語</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.pt-BR.md">Português</a></p>
 
+> **Pascal fork (`p100-pascal-952-port`):** Runs on Linux x86_64 PCs with 1 to 4 Pascal GPUs (`sm_60` / `sm_61`), single-CPU or multi-socket. Adds GP100 FP16x2/SoA kernels, `--tp 2|4` and `--layer-split auto`, DDIO/P2P collectives, chunkwise GDN prefill, and AVX1/AVX2/AVX-512 CPU expert paths.
+>
+> ```bash
+> git clone -b p100-pascal-952-port https://github.com/rgb-128/project-maya.git && cd project-maya
+> ./install-pascal.sh --install-deps
+> ./scripts/run-maya-pascal.sh -- --setup
+> ```
+>
+> Reference 4x Tesla P100-16GB speeds: `Qwen3.8-Flash-Next` UD-Q4_K_XL runs at 1276 tps prefill and 76-105 tps decode at 256K context with Vision; `Qwen3.8-Flash-Next` UD-IQ2_XS runs at 610 tps prefill and 101 tps decode; `GLM-5.3-Flash` Q4_K runs at 155 tps prefill and 17-21 tps decode.
+>
+> Details and benchmarks: [docs/pascal-silicon-whitepaper/README.md](docs/pascal-silicon-whitepaper/README.md) | Wide-model fork: [rgb-128/llama.cpp-p100](https://github.com/rgb-128/llama.cpp-p100)
+
 <p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
 
 <h1 align="center">Project Maya</h1>

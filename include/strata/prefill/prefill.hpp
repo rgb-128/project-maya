@@ -19,7 +19,11 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+
+namespace strata::kernels::cpu { class ExpertPool; }
+namespace strata::kernels { struct TpComm; }
 
 namespace strata::prefill {
 
@@ -105,10 +109,42 @@ public:
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
 
+    /// Hybrid GPU+CPU prefill: offload low-token-count RAM-miss experts (cnt <= MAYA_PREFILL_CPU_MAX) to the idle
+    /// 24-core CPU pool concurrently with GPU resident SoA compute, slashing PCIe miss traffic by 2x-5x!
+    void set_cpu_pool(strata::kernels::cpu::ExpertPool* pool, std::mutex* mu) {
+        cpu_pool_ = pool; cpu_pool_mu_ = mu;
+    }
+
+    /// Tensor-Parallel + Expert-Parallel (TP=2/4 + EP=2/4) multi-GPU batched prefill:
+    /// Call on every rank before `run()`. Rank 0's `run()` spawns all peer ranks concurrently,
+    /// partitions resident+streamed experts across all GPUs, and syncs via `tp_allreduce_f16` (2x/layer).
+    void set_tp(int rank, int tp, const core::ModelGeometry& g_full, const int8_t* global_owner,
+                strata::kernels::TpComm* comm, bool ple_any, std::vector<Prefill*> peers = {}) {
+        tp_rank_ = rank;
+        tp_size_ = tp;
+        g_full_ = g_full;
+        tp_global_owner_ = global_owner;
+        tp_comm_ = comm;
+        tp_ple_on_ = ple_any;
+        tp_peers_ = std::move(peers);
+    }
+
 private:
+    struct TpSync;
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
+    strata::kernels::cpu::ExpertPool* cpu_pool_ = nullptr;
+    std::mutex* cpu_pool_mu_ = nullptr;
+    bool multi_chunk_ = false;          ///< true when a prompt spans >1 chunk (all stages run concurrently)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    int tp_rank_ = 0, tp_size_ = 1;
+    core::ModelGeometry g_full_{};
+    const int8_t* tp_global_owner_ = nullptr;
+    strata::kernels::TpComm* tp_comm_ = nullptr;
+    bool tp_ple_on_ = false;
+    std::vector<Prefill*> tp_peers_;
+    TpSync* tp_sync_ = nullptr;
+    bool run_inner(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipe(std::string& err);  // waits for the chunks handed on to the later stages
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     struct Impl;

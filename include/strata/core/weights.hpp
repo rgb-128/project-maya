@@ -112,6 +112,8 @@ public:
     /// With `skip`, the size of the compacted arena that holds every tensor EXCEPT the named ones.
     static bool pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
                            const std::set<std::string>* skip = nullptr);
+    static bool skip_outside_layers(const std::string& pack_dir, int lb, int le,
+                                    std::set<std::string>& skip, std::string& err);
 
     /// Load every tensor in `<pack_dir>/index.txt` into `arena_base`.
     ///
@@ -126,10 +128,21 @@ public:
     const std::map<std::string, WeightRef>& all() const { return table_; }
     const LoadReport& report() const { return report_; }
 
+    /// Tensor-parallel post-load sharding of tiny F32/BF16 GDN weights (ssm_conv1d, ssm_alpha, ssm_beta, ssm_dt, ssm_a)
+    /// into a compact owned device buffer on the current CUDA device.
+    bool shard_for_tp(int tp_rank, int tp_size, int64_t ssm_state_size, int64_t ssm_k_heads, int64_t ssm_v_heads,
+                      std::string& err);
+    ~WeightTable();
+    WeightTable() = default;
+    WeightTable(const WeightTable&) = delete;
+    WeightTable& operator=(const WeightTable&) = delete;
+
 private:
     friend class NativeDense;
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
+    void* tp_arena_ = nullptr;
+    int tp_arena_dev_ = -1;
 };
 
 }  // namespace strata::core

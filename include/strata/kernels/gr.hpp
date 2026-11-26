@@ -119,4 +119,8 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
 void gr_write(const float* R, const float* block_out, const float* inject, const GrShapes& s, float* R_out,
               void* stream);
 
+/// Batched `gr_write` for `n_tok` contiguous tokens (1 launch instead of `n_tok` launches).
+void gr_write_batch(const float* R, const float* block_out, const float* inject, const GrShapes& s, float* R_out,
+                    int n_tok, void* stream);
+
 }  // namespace strata::kernels

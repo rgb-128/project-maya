@@ -296,6 +296,25 @@ __global__ void gr_write_kernel(const float* __restrict__ R, const float* __rest
     }
 }
 
+__global__ void gr_write_batch_kernel(const float* __restrict__ R, const float* __restrict__ block_out,
+                                      const float* __restrict__ inject, int n_embd, int hc, float* __restrict__ out) {
+    extern __shared__ unsigned char smem_raw[];
+    float* w = (float*) smem_raw;
+    const int tok = (int) blockIdx.y;
+    const float* inj_t = inject + (size_t) tok * hc;
+    if ((int) threadIdx.x < hc) w[threadIdx.x] = 2.0f * sigmoid_f(inj_t[threadIdx.x] / (float) hc);
+    __syncthreads();
+    const long long n = (long long) hc * n_embd;
+    const float* R_t = R + (size_t) tok * n;
+    const float* bo_t = block_out + (size_t) tok * n_embd;
+    float* out_t = out + (size_t) tok * n;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long long) gridDim.x * blockDim.x) {
+        const int c = (int) (i / n_embd), d = (int) (i % n_embd);
+        out_t[i] = R_t[i] + bo_t[d] * w[c];
+    }
+}
+
 }  // namespace
 
 void gr_set_fp32_activations(bool enabled) { fp32_activations = enabled; }
@@ -424,6 +443,23 @@ void gr_write(const float* R, const float* block_out, const float* inject, const
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gr_write: %s\n", cudaGetErrorString(e));
+            std::exit(1);
+        }
+    }
+}
+
+void gr_write_batch(const float* R, const float* block_out, const float* inject, const GrShapes& s, float* R_out,
+                    int n_tok, void* stream) {
+    if (s.n_embd <= 0 || s.hc <= 0 || n_tok <= 0) return;
+    if (n_tok == 1) { gr_write(R, block_out, inject, s, R_out, stream); return; }
+    const long long n = (long long) s.hc * s.n_embd;
+    const unsigned blocks = (unsigned) ((n + THREADS - 1) / THREADS);
+    gr_write_batch_kernel<<<dim3(blocks, (unsigned) n_tok), THREADS, (size_t) s.hc * sizeof(float), (cudaStream_t) stream>>>(
+        R, block_out, inject, (int) s.n_embd, (int) s.hc, R_out);
+    if (stream == nullptr) {
+        const cudaError_t e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "gr_write_batch: %s\n", cudaGetErrorString(e));
             std::exit(1);
         }
     }

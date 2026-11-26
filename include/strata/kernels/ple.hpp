@@ -106,6 +106,12 @@ uint64_t ple_block_scratch_bytes();
 
 void ple_block(const float* emb, const float* hidden, const float* hist_rows, const PleWeights& w,
                PleOut& out, void* scratch, void* stream);
+/// Batched key/value projections (1 weight read for `n_tok` tokens) + per-token postops + history advance.
+/// `key_buf` holds `n_tok * NG_HC_DIM` floats, `val_buf` holds `n_tok * NG_N_EMBD` floats, `q8_buf` holds
+/// `native_q8_1_bytes(NG_N_EMBD, n_tok)` bytes (only used if native_key), `hist_snap` holds `n_tok * NG_HIST * NG_HC_DIM` floats.
+void ple_block_batch(int n_tok, const float* emb, float* hidden, float* hist, const PleWeights& w,
+                     float* key_buf, float* val_buf, void* q8_buf, float* hist_snap, void* scratch, void* stream,
+                     float* batch_scratch = nullptr);
 
 /// Advance the row-fastest normalized history by one token: hist[r,c] = old_hist[r+1,c], then append
 /// normalized[c] at row NG_HIST-1. One thread owns each channel, making the in-place shift well-defined.

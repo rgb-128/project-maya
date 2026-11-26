@@ -199,6 +199,11 @@ public:
     /// Slots filled so far, for the startup report.
     int64_t fills() const { return fills_; }
 
+    /// GP100 K-Major SoA expert repacking: repacks all admitted slots in-place on GPU and auto-repacks future fills
+    /// (including vision VLEND/VRECLAIM refills). Call after startup verify_slot().
+    bool enable_soa_repack(std::string& err);
+    bool soa_repacked() const { return soa_repacked_; }
+
     /// The on-demand vision encoder (serve VLEND / VRECLAIM): with `set_lendable(true)` before `open`, the arena is
     /// mapped in pieces through CUDA's virtual memory API instead of one cudaMalloc, so pieces at its end can be
     /// given back to the driver - another process (the encoder) can then allocate that memory - and mapped again
@@ -240,6 +245,10 @@ private:
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
     int64_t admitted_ = 0;
+    bool soa_repacked_ = false;
+    uint8_t* repack_scratch_ = nullptr;
+    std::vector<int16_t> slot_layer_;   ///< [slots] -> owning layer (or -1)
+    void repack_slot_on_stream(int32_t slot, void* stream);
 };
 
 }  // namespace strata::core

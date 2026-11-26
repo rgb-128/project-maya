@@ -16,13 +16,16 @@ public:
     NativeHead(const NativeHead&) = delete;
     NativeHead& operator=(const NativeHead&) = delete;
 
-    bool load(const std::string& gguf, int64_t n_in, int64_t n_out, std::string& err);
+    bool load(const std::string& gguf, int64_t n_in, int64_t n_out, std::string& err,
+              int tp_rank = 0, int tp_size = 1);
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
     bool loaded() const { return weights_ != nullptr; }
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
     const void* weights() const { return weights_; }
     int type() const { return type_; }
+    int n_out() const { return n_out_; }
+    int row_offset() const { return row_off_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
 
@@ -30,7 +33,7 @@ private:
     void* weights_ = nullptr;
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
-    int n_in_ = 0, n_out_ = 0;
+    int n_in_ = 0, n_out_ = 0, row_off_ = 0;
     int type_ = -1;
 };
 

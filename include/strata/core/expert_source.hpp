@@ -95,6 +95,15 @@ public:
     /// reused staging buffer - otherwise the pool would read the next expert's bytes while computing this one.
     virtual const uint8_t* blob(int64_t layer, int64_t expert) = 0;
 
+    /// NUMA-local blob pointer for a specific socket (`numa_node` = 0 or 1).
+    /// When the source holds a dual-socket mirrored arena (`MAYA_ARENA_NUMA=mirror`), returns the local socket's
+    /// pinned copy (0% QPI traffic for BOTH PCIe GPU DMA and CPU ExpertPool workers!).
+    virtual const uint8_t* blob_for_node(int64_t layer, int64_t expert, int numa_node) {
+        (void) numa_node;
+        return blob(layer, expert);
+    }
+    virtual bool has_node_mirror() const { return false; }
+
     /// Blobs touched, for the driver to report.  A source that does not count returns 0.
     virtual int64_t reads() const { return 0; }
 
@@ -293,7 +302,11 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// `out` (n_tok * k, n_embd).  Each distinct missed expert is computed once for all the tokens routed to it;
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
-                                float* out);
+                                float* out, bool skip_hit_zero = false);
+/// TP+EP global-miss CPU dispatch: computes ONLY experts where `d.host_res[layer*NE + e] < 0` and writes the
+/// pre-weighted sum `out_sum[t, j] = sum_{miss} w[t*k+m] * expert_out[t*k+m, j]` (10x less PCIe than raw parts!).
+void expert_pool_dispatch_tp_misses(ExpertDispatch& d, const float* x_f, const int32_t* ids, const float* w,
+                                    int64_t n_tok, int64_t k, float* out_sum);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about
@@ -437,7 +450,9 @@ public:
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
-    int64_t reads() const { return reads_; }
+    const uint8_t* blob_for_node(int64_t layer, int64_t expert, int numa_node) override;
+    bool has_node_mirror() const override { return base_n1_ != nullptr; }
+    int64_t reads() const override { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
 
@@ -453,10 +468,12 @@ public:
     double load_copy_seconds() const { return load_copy_s_; }
 
 private:
-    void* arena_ = nullptr;          ///< the PinnedArena, owned
+    void* arena_ = nullptr;          ///< the PinnedArena, owned (Node 0 when mirrored)
+    void* arena_n1_ = nullptr;       ///< optional Node 1 mirror PinnedArena (0-QPI dual-socket!)
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)
     uint64_t slice_bytes_ = 0;
     const uint8_t* base_ = nullptr;
+    const uint8_t* base_n1_ = nullptr;
     int64_t blobs_ = 0;
     int64_t n_expert_ = 0;
     int64_t reads_ = 0;

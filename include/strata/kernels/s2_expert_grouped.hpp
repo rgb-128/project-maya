@@ -89,7 +89,7 @@ void moe_hit_grouped_s2_dev(const uint8_t* blob_base, const int32_t* slot_index,
                             const int32_t* d_count, int64_t cap, int64_t blob_bytes, const uint8_t* x_q8_0,
                             void* scratch, float* out, void* stream, const float* x_scales);
 void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const int32_t* count, int64_t cap,
-                 int64_t n_embd, void* stream);
+                 int64_t n_embd, void* stream, const uint32_t* skip = nullptr, uint32_t ring = 0);
 /// Plan v0.3 P6 verify window: `moe_hit_select` over `n` <= 128 routed entries (T tokens x k, flattened), and the
 /// hit kernel with one activation PER TOKEN - entry `dst` reads token `dst / k_per_token`'s rows of `x_q8_0`
 /// ((n_embd/32)*34 bytes each) and `x_scales` (n_embd/32 floats each).  Per hit, bitwise `moe_hit_grouped_s2_dev`.
@@ -99,7 +99,10 @@ void moe_hit_add(float* parts, const float* hit_out, const int32_t* dst, const i
 /// once for all of its entries.  Counts are read from device memory; every entry is bitwise the per-entry kernel.
 void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                     const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
-                    const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream);
+                    const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream,
+                    bool soa = false);
+/// Repack `n_experts` Strata S2 blobs (BLOB bytes each) in-place on device to GP100 K-Major SoA layout.
+void s2_repack_experts_soa(uint8_t* experts_dev, int64_t n_experts, int64_t blob_bytes, void* stream);
 /// Plan v0.3 P6: the groups for `moe_grouped_s2` when every expert id is resident at base + id * blob (the MTP
 /// layer's 512 experts): counts[0] groups, counts[1] entries; entry dst = routing index, tok = index / k_per_tok.
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,

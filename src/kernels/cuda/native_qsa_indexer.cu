@@ -93,6 +93,62 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
     else pooled[std::size_t(b + 1) * D + d] = dead[d];
     if (d == 0 && pos != 0) *block_pos = rope_pos;
 }
+__global__ void append_multi(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+                              int pos_stride, int n_tok, int pos_base, const float* __restrict__ gamma, float epsilon,
+                              float* __restrict__ tail, float* __restrict__ dead,
+                              float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                              int max_cells, float theta_scale, const int32_t* __restrict__ mtab) {
+    const int d = threadIdx.x;
+    const int lane = d & 31;
+    __shared__ float values[D];
+    __shared__ float partials[32];
+    for (int t = 0; t < n_tok; ++t) {
+        const int pos = pos_dev[t * pos_stride];
+        if (pos < 0 || pos >= max_cells) continue;
+        const int slot = pos % R;
+        float incoming = 0.0f;
+        if (d < D) {
+            incoming = __half2float(__float2half_rn(raw[std::size_t(t) * D + d]));
+            if (slot < R - 1) tail[slot * D + d] = incoming;
+        }
+        if (pos == 0 || slot == R - 1) {
+            float mean = 0.0f;
+            if (d < D) {
+                float sum = pos == 0 ? incoming : tail[d];
+#pragma unroll
+                for (int j = 1; j < R; ++j)
+                    sum = __fadd_rn(sum, pos == 0 || j == R - 1 ? incoming : tail[j * D + d]);
+                mean = __fmaf_rn(0.25f, sum, 0.0f);
+            }
+            float square_sum = d < D ? mean * mean : 0.0f;
+            square_sum = warp_sum(square_sum);
+            if (lane == 0) partials[d / 32] = square_sum;
+            __syncthreads();
+            square_sum = lane < THREADS / 32 ? partials[lane] : 0.0f;
+            square_sum = warp_sum(square_sum);
+            const float scale = rsqrtf(square_sum / D + epsilon);
+            if (d < D) values[d] = scale * mean * gamma[d];
+            __syncthreads();
+            if (d < D) {
+                const int b = pos / R;
+                const int rope_pos = pos == 0 ? 0 : pos_base + R * b;
+                float y = values[d];
+                if (d < ROT) {
+                    const int pair = d % (ROT / 2);
+                    const float theta = (pos == 0 ? 0 : mrope_pos(mtab, rope_pos, pair)) * powf(theta_scale, float(pair));
+                    const float c = cosf(theta), s = sinf(theta);
+                    const float a = values[pair], z = values[pair + ROT / 2];
+                    y = d < ROT / 2 ? a * c - z * s : a * s + z * c;
+                }
+                pooled[std::size_t(b) * D + d] = y;
+                if (pos == 0) dead[d] = y;
+                else pooled[std::size_t(b + 1) * D + d] = dead[d];
+                if (d == 0 && pos != 0) *block_pos = rope_pos;
+            }
+        }
+        __syncthreads();
+    }
+}
 // ---- C-2: the batched append.  The pooled key of a completed block b (its last cell pos = 4b+3), computed with
 // the single append's arithmetic: keys rounded through F16, summed tail[0]+tail[1]+tail[2]+incoming in that order,
 // the RMS norm, gamma, the rotation at pos_base + 4b.  `k(j)` is the key of the block's cell j: a row of this batch
@@ -214,6 +270,23 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
     const float theta_scale = powf(freq_base, -2.0f / ROT);
     append<<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_base,gamma,epsilon,
         b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,mrope_table());
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_qsa_indexer_append_multi(const float* raw, const int32_t* relative_pos_device,
+                                     int pos_stride, int n_tok, int32_t pos_base, const float* gamma,
+                                     float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s,
+                                     int64_t max_cells, float freq_base, void* stream) {
+    if (n_tok <= 0) return;
+    if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
+        int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        !std::isfinite(freq_base) || freq_base <= 1.0f || pos_stride < 1)
+        throw std::invalid_argument("native QSA indexer (multi): invalid parameters");
+    const float theta_scale = powf(freq_base, -2.0f / ROT);
+    append_multi<<<1, THREADS, 0, static_cast<cudaStream_t>(stream)>>>(
+        raw, relative_pos_device, pos_stride, n_tok, pos_base, gamma, epsilon,
+        b.tail, b.dead, b.pooled, b.block_pos, int(max_cells), theta_scale, mrope_table());
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

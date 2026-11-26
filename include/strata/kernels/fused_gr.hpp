@@ -28,14 +28,19 @@ struct FusedGrArgs {
     const float* bo_prev = nullptr;    ///< that half's block output, n_embd
     const float* inj_prev = nullptr;   ///< that half's injection, hc
     const float* w_norm = nullptr;     ///< (hc * n_embd) f32
-    const uint16_t* w_down = nullptr;  ///< bf16 [hc_lr][hc*n_embd]
-    const uint16_t* w_up = nullptr;    ///< bf16 [hc*n_embd][hc_lr]
+    const uint16_t* w_down = nullptr;  ///< bf16 [hc_lr][hc*n_embd] (or null when w_down_q8 is set)
+    const uint16_t* w_up = nullptr;    ///< bf16 [hc*n_embd][hc_lr] (or null when w_up_q8 is set)
+    const void* w_down_q8 = nullptr;   ///< native GGUF Q8_0 [hc_lr][hc*n_embd] (optional, 1.88x less VRAM/BW)
+    const void* w_up_q8 = nullptr;     ///< native GGUF Q8_0 [hc*n_embd][hc_lr] (optional, 1.88x less VRAM/BW)
+    bool w_down_q8_soa = false;        ///< true when w_down_q8 is kGgmlQ8_0_SOA (108, K-Major)
+    bool w_up_q8_soa = false;          ///< true when w_up_q8 is kGgmlQ8_0_SOA (108, K-Major)
     const uint16_t* w_inject = nullptr;///< bf16 [hc][hc*n_embd], or null (the final mixer)
     float eps = 1e-6f;
     float* lo = nullptr;               ///< workspace, hc_lr floats
     float* rs = nullptr;               ///< workspace, hc floats
     float* inject_out = nullptr;       ///< hc floats (when w_inject)
     float* mixed = nullptr;            ///< n_embd
+    void* mixed_q8 = nullptr;          ///< optional [T][n_embd/32] Q8_1 quantized `mixed` (set on a[0] only)
 };
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
